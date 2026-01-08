@@ -36,6 +36,12 @@ struct NodeConfig {
     api_mode: String,
     region: String,
     capacity: u32,
+    #[serde(default = "default_price")]
+    price_per_thousand_tokens: f64,
+}
+
+fn default_price() -> f64 {
+    0.001
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,7 +59,7 @@ struct Config {
 }
 
 fn default_server_url() -> String {
-    "wss://aiassist.net/api/v1/pin/ws".to_string()
+    "wss://aiassist-secure.replit.app/api/v1/pin/ws".to_string()
 }
 
 fn default_reconnect_delay() -> u64 {
@@ -148,6 +154,8 @@ struct RegisterNodeMessage {
     models: Vec<String>,
     capacity: u32,
     region: String,
+    #[serde(rename = "pricePerThousandTokens")]
+    price_per_thousand_tokens: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -553,6 +561,7 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                                 models: models.clone(),
                                                 capacity: node_config.capacity,
                                                 region: node_config.region.clone(),
+                                                price_per_thousand_tokens: node_config.price_per_thousand_tokens,
                                             };
                                             
                                             if let Err(e) = write.send(Message::Text(serde_json::to_string(&register_msg)?)).await {

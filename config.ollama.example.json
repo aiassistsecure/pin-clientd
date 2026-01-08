@@ -7,7 +7,8 @@
       "inferenceUri": "http://localhost:11434",
       "apiMode": "ollama",
       "region": "us-east",
-      "capacity": 5
+      "capacity": 5,
+      "pricePerThousandTokens": 0.001
     }
   ]
 }
