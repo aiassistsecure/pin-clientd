@@ -16,7 +16,7 @@ static TOTAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
 #[derive(Parser, Debug)]
 #[command(name = "pin-clientd")]
 #[command(about = "PIN Client Daemon - Headless P2P Inference Network Node")]
-#[command(version = "2.2.0")]
+#[command(version = "2.2.1")]
 struct Args {
     #[arg(short, long, default_value = "config.json")]
     config: PathBuf,
