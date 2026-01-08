@@ -76,26 +76,27 @@ Match `OLLAMA_NUM_PARALLEL` to your daemon `-n` value for optimal throughput.
   - [text-generation-inference](https://github.com/huggingface/text-generation-inference) - HuggingFace's solution
   - [LMStudio](https://lmstudio.ai/) - Desktop app with API server
 
-### Download Pre-built Binary
-
-```bash
-# Linux x86_64
-curl -LO https://github.com/aiassistsecure/pin-clientd/releases/latest/download/pin-clientd-linux-x86_64
-chmod +x pin-clientd-linux-x86_64
-mv pin-clientd-linux-x86_64 pin-clientd
-
-# macOS (Apple Silicon)
-curl -LO https://github.com/aiassistsecure/pin-clientd/releases/latest/download/pin-clientd-darwin-arm64
-chmod +x pin-clientd-darwin-arm64
-mv pin-clientd-darwin-arm64 pin-clientd
-```
 
 ### Build from Source
+=======
+  
+Build in MSYS2:
+```bash
+rustup target add x86_64-pc-windows-gnu
+rustup default stable-x86_64-pc-windows-gnu
+cargo clean
+
+```
+
+## Build
 
 ```bash
 git clone https://github.com/aiassistsecure/pin-clientd.git
 cd pin-clientd
 ./build.sh
+
+// or simply
+cargo build --release
 ```
 
 Or manually with cargo:
