@@ -3,6 +3,56 @@
 
 ---
 
+## Version 2.2.1 (January 2026)
+
+### Quality Floor Enforcement
+
+Raised the minimum speed threshold from 1 tok/s to **10 tok/s**. Systems below this threshold are automatically rejected regardless of accuracy. This ensures all operators in the network meet a baseline performance standard.
+
+| Tier | Accuracy | Speed | Status |
+|------|----------|-------|--------|
+| `verified` | >90% | >20 tok/s | Highest priority |
+| `standard` | >70% | >10 tok/s | Normal priority |
+| `failed` | <70% or <10 tok/s | Blocked |
+
+### Custom Interview Model
+
+Operators can now specify which model to use for quality interviews via the new `interviewModel` config field:
+
+```json
+{
+  "alias": "GPU-1",
+  "inferenceUri": "http://localhost:11434",
+  "apiMode": "ollama",
+  "region": "us-east",
+  "capacity": 10,
+  "interviewModel": "phi3:medium"
+}
+```
+
+**Why this matters:**
+- New models release faster than we can update benchmark lists
+- Prove your best model works, not just a baseline
+- Enables custom and fine-tuned model validation
+- Full flexibility without compromising quality checks
+
+**Selection Priority:**
+1. `interviewModel` from config (highest priority)
+2. First listed model (OpenAI mode)
+3. Benchmark model like llama3:8b (Ollama mode fallback)
+
+### Bug Fixes
+
+- Fixed potential crash when model list is empty in OpenAI mode
+- Improved error messages when no interview model can be found
+- Better logging for interview model selection decisions
+
+### Breaking Changes
+
+None. The `interviewModel` field is optional. Existing configurations continue to work unchanged.
+
+---
+
 ## Version 2.2.0 (January 2026)
 
 ### New Features
