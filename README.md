@@ -60,10 +60,28 @@ Environment="OLLAMA_NUM_PARALLEL=4"
 
 Match `OLLAMA_NUM_PARALLEL` to your daemon `-n` value for optimal throughput.
 
+### Prerequisites
+- **Rust** (1.70+): Install via [rustup](https://rustup.rs/)
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  source ~/.cargo/env
+  ```
+  
+Build in MSYS2:
+```bash
+rustup target add x86_64-pc-windows-gnu
+rustup default stable-x86_64-pc-windows-gnu
+cargo clean
+
+```
+
 ## Build
 
 ```bash
 ./build.sh
+
+// or simply
+cargo build --release
 ```
 
 ## Configuration
