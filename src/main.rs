@@ -38,6 +38,8 @@ struct NodeConfig {
     capacity: u32,
     #[serde(default = "default_price")]
     price_per_thousand_tokens: f64,
+    #[serde(default)]
+    interview_model: Option<String>,
 }
 
 fn default_price() -> f64 {
@@ -156,6 +158,8 @@ struct RegisterNodeMessage {
     region: String,
     #[serde(rename = "pricePerThousandTokens")]
     price_per_thousand_tokens: f64,
+    #[serde(rename = "interviewModel", skip_serializing_if = "Option::is_none")]
+    interview_model: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -562,6 +566,7 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                                 capacity: node_config.capacity,
                                                 region: node_config.region.clone(),
                                                 price_per_thousand_tokens: node_config.price_per_thousand_tokens,
+                                                interview_model: node_config.interview_model.clone(),
                                             };
                                             
                                             if let Err(e) = write.send(Message::Text(serde_json::to_string(&register_msg)?)).await {

@@ -9,7 +9,8 @@
       "apiMode": "ollama",
       "region": "us-east",
       "capacity": 10,
-      "pricePerThousandTokens": 0.001
+      "pricePerThousandTokens": 0.001,
+      "interviewModel": "llama3:8b"
     }
   ]
 }
