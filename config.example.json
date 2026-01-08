@@ -1,0 +1,15 @@
+{
+  "clientId": "op_your_operator_id",
+  "apiSecret": "your_api_secret_from_registration",
+  "payoutAddress": "0x_your_bsc_wallet_address",
+  "nodes": [
+    {
+      "alias": "GPU-1",
+      "inferenceUri": "http://localhost:11434",
+      "apiMode": "ollama",
+      "region": "us-east",
+      "capacity": 10,
+      "pricePerThousandTokens": 0.001
+    }
+  ]
+}

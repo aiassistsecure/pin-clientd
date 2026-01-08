@@ -1,0 +1,19 @@
+[Unit]
+Description=PIN Client Daemon - P2P Inference Network Operator
+After=network-online.target ollama.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/pin-clientd
+ExecStart=/opt/pin-clientd/pin-clientd --config /opt/pin-clientd/config.json
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+Environment=RUST_LOG=info
+
+[Install]
+WantedBy=multi-user.target

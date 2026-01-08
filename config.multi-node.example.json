@@ -1,0 +1,30 @@
+{
+  "clientId": "op_your_operator_id",
+  "apiSecret": "your_api_secret_from_registration",
+  "nodes": [
+    {
+      "alias": "ollama-node",
+      "inferenceUri": "http://localhost:11434",
+      "apiMode": "ollama",
+      "region": "us-east",
+      "capacity": 10,
+      "pricePerThousandTokens": 0.001
+    },
+    {
+      "alias": "vllm-node",
+      "inferenceUri": "http://localhost:8000",
+      "apiMode": "openai",
+      "region": "us-east",
+      "capacity": 20,
+      "pricePerThousandTokens": 0.002
+    },
+    {
+      "alias": "lmstudio-node",
+      "inferenceUri": "http://192.168.1.100:1234",
+      "apiMode": "openai",
+      "region": "us-west",
+      "capacity": 5,
+      "pricePerThousandTokens": 0.0005
+    }
+  ]
+}
