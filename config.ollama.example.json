@@ -1,0 +1,13 @@
+{
+  "clientId": "op_your_operator_id",
+  "apiSecret": "your_api_secret_from_registration",
+  "nodes": [
+    {
+      "alias": "ollama-server",
+      "inferenceUri": "http://localhost:11434",
+      "apiMode": "ollama",
+      "region": "us-east",
+      "capacity": 5
+    }
+  ]
+}

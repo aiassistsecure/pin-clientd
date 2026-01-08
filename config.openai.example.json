@@ -1,0 +1,13 @@
+{
+  "clientId": "op_your_operator_id",
+  "apiSecret": "your_api_secret_from_registration",
+  "nodes": [
+    {
+      "alias": "vllm-server",
+      "inferenceUri": "http://localhost:8000",
+      "apiMode": "openai",
+      "region": "us-west",
+      "capacity": 20
+    }
+  ]
+}
