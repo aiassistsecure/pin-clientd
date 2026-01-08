@@ -1,4 +1,4 @@
-# PIN Client Daemon (pin-clientd) v2.2.0
+# PIN Client Daemon (pin-clientd) v2.2.2
 
 The PIN Client Daemon connects your local LLM inference server to the AiAssist P2P Inference Network.
 
