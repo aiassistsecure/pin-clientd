@@ -1,4 +1,4 @@
-# PIN Client Daemon (pin-clientd) v2.2.2
+# PIN Client Daemon (pin-clientd) v2.3.0
 
 The PIN Client Daemon connects your local LLM inference server to the AiAssist P2P Inference Network.
 
@@ -225,6 +225,34 @@ sudo journalctl -u pin-clientd -f  # View logs
 | `region` | Yes | Geographic region (see table below) |
 | `capacity` | Yes | Max concurrent requests |
 | `pricePerThousandTokens` | No | Your price per 1K tokens in USD (default: $0.001) |
+
+## Streaming
+
+The daemon streams tokens when the server sets `stream: true` on an
+`INFERENCE_REQUEST`. Both API modes are supported: Ollama NDJSON from
+`POST /api/chat`, and OpenAI-compatible SSE from `POST /v1/chat/completions`
+(requested with `stream_options.include_usage` so the final frame carries real
+token counts).
+
+Streaming is **additive** to the wire protocol. The daemon emits:
+
+```jsonc
+{ "type": "INFERENCE_CHUNK", "request_id": "pin_req_...", "index": 0, "delta": "Hel" }
+{ "type": "INFERENCE_CHUNK", "request_id": "pin_req_...", "index": 1, "delta": "lo" }
+```
+
+…and then the **same terminal `INFERENCE_RESPONSE` as always**, carrying the
+fully assembled message and the usage counts. Consequences worth knowing:
+
+- A server that ignores `INFERENCE_CHUNK` sees no behavioral change.
+- A daemon that predates this release ignores `stream` and returns only the
+  final response, so a streaming-aware server degrades to non-streaming
+  instead of hanging.
+- **Billing is unchanged** — it happens once, off the final message. Chunks
+  are never billed, and token counts are never estimated: if a backend does
+  not report usage, the counts are zero rather than a guess.
+- If the WebSocket writer disappears mid-generation, the stream aborts rather
+  than burning GPU on output nobody will read.
 
 ## API Modes
 
