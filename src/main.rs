@@ -16,7 +16,7 @@ static TOTAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
 #[derive(Parser, Debug)]
 #[command(name = "pin-clientd")]
 #[command(about = "PIN Client Daemon - Headless P2P Inference Network Node")]
-#[command(version = "2.2.1")]
+#[command(version = "2.3.0")]
 struct Args {
     #[arg(short, long, default_value = "config.json")]
     config: PathBuf,
@@ -146,6 +146,74 @@ struct ClientMessage {
     error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     models: Option<Vec<String>>,
+}
+
+/// One token (or small run of tokens) on its way to the consumer.
+///
+/// Streaming is purely ADDITIVE to the existing protocol: chunks are emitted
+/// only when the server sets `payload.stream`, and the SAME terminal
+/// `INFERENCE_RESPONSE` is still sent, carrying the assembled message and the
+/// real usage counts. A server that ignores chunks behaves exactly as before,
+/// and billing keeps happening once off the final message -- never off a
+/// chunk. No capability negotiation is needed in either direction.
+#[derive(Debug, Serialize)]
+struct ChunkMessage {
+    #[serde(rename = "type")]
+    msg_type: String,
+    request_id: String,
+    index: u32,
+    delta: String,
+}
+
+impl ChunkMessage {
+    fn new(request_id: &str, index: u32, delta: String) -> Self {
+        Self {
+            msg_type: "INFERENCE_CHUNK".to_string(),
+            request_id: request_id.to_string(),
+            index,
+            delta,
+        }
+    }
+}
+
+/// One NDJSON line from Ollama `/api/chat` with `stream: true`.
+#[derive(Debug, Deserialize)]
+struct OllamaStreamChunk {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    message: Option<ChatMessage>,
+    #[serde(default)]
+    done: bool,
+    #[serde(default)]
+    prompt_eval_count: Option<u32>,
+    #[serde(default)]
+    eval_count: Option<u32>,
+}
+
+/// One `data:` frame from an OpenAI-compatible SSE stream.
+#[derive(Debug, Deserialize)]
+struct OpenAIStreamChunk {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    choices: Vec<OpenAIStreamChoice>,
+    #[serde(default)]
+    usage: Option<OpenAIUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAIStreamChoice {
+    #[serde(default)]
+    delta: OpenAIStreamDelta,
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct OpenAIStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -387,6 +455,233 @@ async fn chat_completion(
         "openai" => chat_completion_openai(base_url, model, messages).await,
         _ => chat_completion_ollama(base_url, model, messages).await,
     }
+}
+
+/// Streaming variant. Emits an `INFERENCE_CHUNK` per delta through `tx` and
+/// returns the assembled `OpenAIResponse` so the caller still sends the usual
+/// terminal `INFERENCE_RESPONSE`.
+///
+/// A send failure on `tx` means the WebSocket writer is gone; generation is
+/// abandoned at that point rather than burning GPU on output nobody will read.
+async fn chat_completion_stream(
+    base_url: &str,
+    model: &str,
+    messages: Vec<ChatMessage>,
+    api_mode: &str,
+    request_id: &str,
+    tx: &mpsc::UnboundedSender<String>,
+) -> Result<OpenAIResponse, String> {
+    match api_mode {
+        "openai" => {
+            chat_completion_stream_openai(base_url, model, messages, request_id, tx).await
+        }
+        _ => chat_completion_stream_ollama(base_url, model, messages, request_id, tx).await,
+    }
+}
+
+fn send_chunk(
+    tx: &mpsc::UnboundedSender<String>,
+    request_id: &str,
+    index: u32,
+    delta: String,
+) -> Result<(), String> {
+    let msg = ChunkMessage::new(request_id, index, delta);
+    let json = serde_json::to_string(&msg)
+        .map_err(|e| format!("Failed to encode chunk: {}", e))?;
+    tx.send(json)
+        .map_err(|_| "WebSocket writer closed mid-stream".to_string())
+}
+
+async fn chat_completion_stream_ollama(
+    base_url: &str,
+    model: &str,
+    messages: Vec<ChatMessage>,
+    request_id: &str,
+    tx: &mpsc::UnboundedSender<String>,
+) -> Result<OpenAIResponse, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
+
+    let request = OllamaChatRequest {
+        model: model.to_string(),
+        messages,
+        stream: Some(true),
+    };
+
+    let response = client
+        .post(&url)
+        .json(&request)
+        .timeout(Duration::from_secs(600))
+        .send()
+        .await
+        .map_err(|e| format!("Ollama request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Ollama error {}: {}", status, body));
+    }
+
+    let mut stream = response.bytes_stream();
+    // Ollama emits newline-delimited JSON. A chunk boundary can land mid-line,
+    // so hold the partial line in `buf` rather than parsing per network read.
+    let mut buf = String::new();
+    let mut content = String::new();
+    let mut resolved_model = model.to_string();
+    let mut prompt_tokens = 0u32;
+    let mut completion_tokens = 0u32;
+    let mut index = 0u32;
+
+    while let Some(item) = stream.next().await {
+        let bytes = item.map_err(|e| format!("Ollama stream error: {}", e))?;
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(nl) = buf.find('\n') {
+            let line: String = buf.drain(..=nl).collect();
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let chunk: OllamaStreamChunk = match serde_json::from_str(line) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Skipping unparseable Ollama stream line: {}", e);
+                    continue;
+                }
+            };
+            if let Some(m) = chunk.model {
+                resolved_model = m;
+            }
+            if let Some(msg) = chunk.message {
+                if !msg.content.is_empty() {
+                    content.push_str(&msg.content);
+                    send_chunk(tx, request_id, index, msg.content)?;
+                    index += 1;
+                }
+            }
+            if chunk.done {
+                prompt_tokens = chunk.prompt_eval_count.unwrap_or(prompt_tokens);
+                completion_tokens = chunk.eval_count.unwrap_or(completion_tokens);
+            }
+        }
+    }
+
+    Ok(OpenAIResponse {
+        model: resolved_model,
+        choices: vec![OpenAIChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content,
+            },
+            finish_reason: Some("stop".to_string()),
+        }],
+        usage: Some(OpenAIUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens + completion_tokens,
+        }),
+    })
+}
+
+async fn chat_completion_stream_openai(
+    base_url: &str,
+    model: &str,
+    messages: Vec<ChatMessage>,
+    request_id: &str,
+    tx: &mpsc::UnboundedSender<String>,
+) -> Result<OpenAIResponse, String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
+
+    // `stream_options.include_usage` is how an OpenAI-compatible server is
+    // asked to put real token counts in the final frame. Servers that don't
+    // support it ignore the field, and usage stays zero -- the same outcome as
+    // a missing `usage` on the non-streaming path today. Counts are never
+    // estimated: billing on a guess would be worse than billing on zero.
+    let request = serde_json::json!({
+        "model": model,
+        "messages": messages,
+        "stream": true,
+        "stream_options": { "include_usage": true },
+    });
+
+    let response = client
+        .post(&url)
+        .json(&request)
+        .timeout(Duration::from_secs(600))
+        .send()
+        .await
+        .map_err(|e| format!("OpenAI request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("OpenAI error {}: {}", status, body));
+    }
+
+    let mut stream = response.bytes_stream();
+    let mut buf = String::new();
+    let mut content = String::new();
+    let mut resolved_model = model.to_string();
+    let mut usage: Option<OpenAIUsage> = None;
+    let mut finish_reason: Option<String> = None;
+    let mut index = 0u32;
+
+    while let Some(item) = stream.next().await {
+        let bytes = item.map_err(|e| format!("OpenAI stream error: {}", e))?;
+        buf.push_str(&String::from_utf8_lossy(&bytes));
+
+        while let Some(nl) = buf.find('\n') {
+            let line: String = buf.drain(..=nl).collect();
+            let line = line.trim();
+            if line.is_empty() || !line.starts_with("data:") {
+                continue; // SSE comments and blank separators
+            }
+            let data = line["data:".len()..].trim();
+            if data == "[DONE]" {
+                continue;
+            }
+            let chunk: OpenAIStreamChunk = match serde_json::from_str(data) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Skipping unparseable SSE frame: {}", e);
+                    continue;
+                }
+            };
+            if let Some(m) = chunk.model {
+                resolved_model = m;
+            }
+            if chunk.usage.is_some() {
+                usage = chunk.usage;
+            }
+            if let Some(choice) = chunk.choices.into_iter().next() {
+                if choice.finish_reason.is_some() {
+                    finish_reason = choice.finish_reason;
+                }
+                if let Some(delta) = choice.delta.content {
+                    if !delta.is_empty() {
+                        content.push_str(&delta);
+                        send_chunk(tx, request_id, index, delta)?;
+                        index += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(OpenAIResponse {
+        model: resolved_model,
+        choices: vec![OpenAIChoice {
+            index: 0,
+            message: ChatMessage {
+                role: "assistant".to_string(),
+                content,
+            },
+            finish_reason: finish_reason.or_else(|| Some("stop".to_string())),
+        }],
+        usage,
+    })
 }
 
 async fn run_interview_prompt(
@@ -646,8 +941,11 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                         let mode = first_node.api_mode.clone();
                                         let model = payload.model.clone();
                                         let messages = payload.messages;
-                                        
-                                        info!("[#{}] Inference request: {} ({}) via {} [queued]", count, request_id, model, mode);
+                                        let stream = payload.stream;
+
+                                        info!("[#{}] Inference request: {} ({}) via {}{} [queued]",
+                                            count, request_id, model, mode,
+                                            if stream { " streaming" } else { "" });
                                         
                                         let sem = semaphore.clone();
                                         let tx = tx.clone();
@@ -656,7 +954,14 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                             let _permit = sem.acquire().await.expect("semaphore closed");
                                             
                                             info!("[#{}] Starting inference for {}", count, request_id);
-                                            let result = chat_completion(&uri, &model, messages, &mode).await;
+                                            let result = if stream {
+                                                chat_completion_stream(
+                                                    &uri, &model, messages, &mode, &request_id, &tx,
+                                                )
+                                                .await
+                                            } else {
+                                                chat_completion(&uri, &model, messages, &mode).await
+                                            };
 
                                             let response = match result {
                                                 Ok(openai_resp) => {
@@ -814,4 +1119,175 @@ async fn main() {
     }
 
     info!("Shutdown complete. Total requests: {}", TOTAL_REQUESTS.load(Ordering::SeqCst));
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    /// Serve one HTTP response whose body is written in the given pieces.
+    /// Splitting a JSON line across pieces is the whole point: a naive
+    /// parser that treats each network read as a complete line loses tokens.
+    fn serve_once(pieces: Vec<String>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut discard = [0u8; 4096];
+            let _ = sock.read(&mut discard);
+            let body: String = pieces.concat();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).unwrap();
+            for piece in pieces {
+                sock.write_all(piece.as_bytes()).unwrap();
+                sock.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        format!("http://{}", addr)
+    }
+
+    fn drain(rx: &mut mpsc::UnboundedReceiver<String>) -> Vec<serde_json::Value> {
+        let mut out = Vec::new();
+        while let Ok(s) = rx.try_recv() {
+            out.push(serde_json::from_str(&s).unwrap());
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn ollama_stream_emits_chunks_and_assembles_final_message() {
+        let l1 = r#"{"model":"muse-local:latest","message":{"role":"assistant","content":"Hel"},"done":false}"#;
+        let l2 = r#"{"model":"muse-local:latest","message":{"role":"assistant","content":"lo"},"done":false}"#;
+        let l3 = r#"{"model":"muse-local:latest","message":{"role":"assistant","content":" world"},"done":false}"#;
+        let l4 = r#"{"model":"muse-local:latest","message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":7,"eval_count":3}"#;
+
+        // Deliberately split l2 mid-JSON across two network writes.
+        let (a, b) = l2.split_at(20);
+        let base = serve_once(vec![
+            format!("{}\n{}", l1, a),
+            format!("{}\n{}\n{}\n", b, l3, l4),
+        ]);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let resp = chat_completion_stream_ollama(
+            &base,
+            "muse-local:latest",
+            vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            "pin_req_test",
+            &tx,
+        )
+        .await
+        .expect("stream should succeed");
+
+        let chunks = drain(&mut rx);
+        assert_eq!(chunks.len(), 3, "one chunk per non-empty delta");
+        assert_eq!(chunks[0]["type"], "INFERENCE_CHUNK");
+        assert_eq!(chunks[0]["request_id"], "pin_req_test");
+        assert_eq!(chunks[0]["index"], 0);
+        assert_eq!(chunks[1]["index"], 1);
+        assert_eq!(chunks[2]["index"], 2);
+
+        let deltas: String = chunks
+            .iter()
+            .map(|c| c["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(deltas, "Hello world", "split line must not lose tokens");
+
+        // The terminal response is unchanged in shape and carries real usage,
+        // so billing keeps working off the final message.
+        assert_eq!(resp.choices[0].message.content, "Hello world");
+        assert_eq!(deltas, resp.choices[0].message.content);
+        let usage = resp.usage.expect("usage from the done frame");
+        assert_eq!(usage.prompt_tokens, 7);
+        assert_eq!(usage.completion_tokens, 3);
+        assert_eq!(usage.total_tokens, 10);
+    }
+
+    #[tokio::test]
+    async fn openai_sse_stream_parses_deltas_done_and_usage() {
+        let base = serve_once(vec![
+            "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"Hel\"}}]}\n\n".to_string(),
+            "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\n".to_string(),
+            "data: {\"model\":\"m\",\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ]);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let resp = chat_completion_stream_openai(
+            &base,
+            "m",
+            vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            "pin_req_sse",
+            &tx,
+        )
+        .await
+        .expect("stream should succeed");
+
+        let chunks = drain(&mut rx);
+        assert_eq!(chunks.len(), 2, "[DONE] and the usage-only frame are not chunks");
+        assert_eq!(resp.choices[0].message.content, "Hello");
+        assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
+        let usage = resp.usage.expect("usage frame");
+        assert_eq!(usage.total_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn stream_aborts_when_the_websocket_writer_is_gone() {
+        let base = serve_once(vec![
+            format!("{}\n", r#"{"message":{"role":"assistant","content":"x"},"done":false}"#),
+            format!("{}\n", r#"{"message":{"role":"assistant","content":"y"},"done":true}"#),
+        ]);
+
+        let (tx, rx) = mpsc::unbounded_channel::<String>();
+        drop(rx); // consumer disconnected mid-generation
+
+        let err = chat_completion_stream_ollama(
+            &base,
+            "m",
+            vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            "pin_req_dead",
+            &tx,
+        )
+        .await
+        .expect_err("must not keep generating for a consumer that vanished");
+        assert!(err.contains("closed mid-stream"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn non_success_status_is_surfaced_not_swallowed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut discard = [0u8; 4096];
+            let _ = sock.read(&mut discard);
+            let body = "model not found";
+            let _ = sock.write_all(
+                format!(
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(), body
+                )
+                .as_bytes(),
+            );
+        });
+
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        let err = chat_completion_stream_ollama(
+            &format!("http://{}", addr),
+            "nope",
+            vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            "pin_req_404",
+            &tx,
+        )
+        .await
+        .expect_err("404 must be an error");
+        assert!(err.contains("404"), "got: {}", err);
+    }
 }
