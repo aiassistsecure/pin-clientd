@@ -188,6 +188,17 @@ impl GenOpts {
 struct ChatMessage {
     role: String,
     content: String,
+    /// Reasoning-model output. Ollama streams a thinking model's reasoning
+    /// here and leaves `content` EMPTY for the whole thinking phase:
+    ///
+    ///   {"message":{"role":"assistant","content":"","thinking":"hi"},"done":false}
+    ///
+    /// Undeclared, serde dropped it, and a thinking model looked like a hung
+    /// request -- frames arriving, every one skipped for empty content,
+    /// nothing ever sent to the server. Skipped on serialize so requests we
+    /// send upstream are unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    thinking: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -228,15 +239,30 @@ struct ChunkMessage {
     request_id: String,
     index: u32,
     delta: String,
+    /// "content" or "thinking". A server that ignores this field treats
+    /// everything as content, which is the pre-existing behaviour -- so the
+    /// addition stays backward compatible.
+    kind: &'static str,
 }
 
 impl ChunkMessage {
-    fn new(request_id: &str, index: u32, delta: String) -> Self {
+    fn content(request_id: &str, index: u32, delta: String) -> Self {
         Self {
             msg_type: "INFERENCE_CHUNK".to_string(),
             request_id: request_id.to_string(),
             index,
             delta,
+            kind: "content",
+        }
+    }
+
+    fn thinking(request_id: &str, index: u32, delta: String) -> Self {
+        Self {
+            msg_type: "INFERENCE_CHUNK".to_string(),
+            request_id: request_id.to_string(),
+            index,
+            delta,
+            kind: "thinking",
         }
     }
 }
@@ -559,11 +585,8 @@ async fn chat_completion_stream(
 
 fn send_chunk(
     tx: &mpsc::UnboundedSender<String>,
-    request_id: &str,
-    index: u32,
-    delta: String,
+    msg: ChunkMessage,
 ) -> Result<(), String> {
-    let msg = ChunkMessage::new(request_id, index, delta);
     let json = serde_json::to_string(&msg)
         .map_err(|e| format!("Failed to encode chunk: {}", e))?;
     tx.send(json)
@@ -616,6 +639,7 @@ async fn chat_completion_stream_ollama(
     // so hold the partial line in `buf` rather than parsing per network read.
     let mut buf = String::new();
     let mut content = String::new();
+    let mut thinking = String::new();
     let mut resolved_model = model.to_string();
     let mut prompt_tokens = 0u32;
     let mut completion_tokens = 0u32;
@@ -648,13 +672,27 @@ async fn chat_completion_stream_ollama(
                 resolved_model = m;
             }
             if let Some(msg) = chunk.message {
+                // Thinking FIRST: a reasoning model emits only `thinking` for
+                // the whole reasoning phase, with content empty. Skipping
+                // these is what made a working model look like a hung request.
+                if let Some(think) = msg.thinking {
+                    if !think.is_empty() {
+                        thinking.push_str(&think);
+                        send_chunk(tx, ChunkMessage::thinking(request_id, index, think))?;
+                        if index == 0 {
+                            info!("[{}] first THINKING delta after {:?}",
+                                request_id, t0.elapsed());
+                        }
+                        index += 1;
+                    }
+                }
                 if !msg.content.is_empty() {
-                    content.push_str(&msg.content);
-                    send_chunk(tx, request_id, index, msg.content)?;
-                    if index == 0 {
-                        info!("[{}] first token queued to server after {:?}",
+                    if content.is_empty() {
+                        info!("[{}] first content delta after {:?}",
                             request_id, t0.elapsed());
                     }
+                    content.push_str(&msg.content);
+                    send_chunk(tx, ChunkMessage::content(request_id, index, msg.content))?;
                     index += 1;
                 }
             }
@@ -669,8 +707,17 @@ async fn chat_completion_stream_ollama(
 
     // Reaching here means the body ended. If `done` never arrived, say so --
     // a truncated stream and a clean finish must not look identical.
-    info!("[{}] stream ended after {:?}: {} reads, {} chunks sent, {} chars",
-        request_id, t0.elapsed(), reads, index, content.len());
+    info!("[{}] stream ended after {:?}: {} reads, {} chunks sent, {} content chars, {} thinking chars",
+        request_id, t0.elapsed(), reads, index, content.len(), thinking.len());
+
+    // A reasoning model that spends its whole token budget thinking answers
+    // with nothing. Silence is indistinguishable from a broken pipe, so name
+    // it: the operator can then raise max_tokens instead of hunting a bug.
+    if content.is_empty() && !thinking.is_empty() {
+        warn!("[{}] model produced {} chars of reasoning and NO answer -- \
+               it likely hit its token budget while still thinking",
+            request_id, thinking.len());
+    }
 
     Ok(OpenAIResponse {
         model: resolved_model,
@@ -679,6 +726,7 @@ async fn chat_completion_stream_ollama(
             message: ChatMessage {
                 role: "assistant".to_string(),
                 content,
+                thinking: if thinking.is_empty() { None } else { Some(thinking) },
             },
             finish_reason: Some("stop".to_string()),
         }],
@@ -775,7 +823,7 @@ async fn chat_completion_stream_openai(
                 if let Some(delta) = choice.delta.content {
                     if !delta.is_empty() {
                         content.push_str(&delta);
-                        send_chunk(tx, request_id, index, delta)?;
+                        send_chunk(tx, ChunkMessage::content(request_id, index, delta))?;
                         index += 1;
                     }
                 }
@@ -790,6 +838,7 @@ async fn chat_completion_stream_openai(
             message: ChatMessage {
                 role: "assistant".to_string(),
                 content,
+                thinking: None,
             },
             finish_reason: finish_reason.or_else(|| Some("stop".to_string())),
         }],
@@ -808,6 +857,7 @@ async fn run_interview_prompt(
     let messages = vec![ChatMessage {
         role: "user".to_string(),
         content: prompt.prompt.clone(),
+        thinking: None,
     }];
     
     // NO token cap here, deliberately.
@@ -1362,7 +1412,7 @@ mod stream_tests {
         let resp = chat_completion_stream_ollama(
             &base,
             "muse-local:latest",
-            vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
             GenOpts::default(),
             "pin_req_test",
             &tx,
@@ -1407,7 +1457,7 @@ mod stream_tests {
         let resp = chat_completion_stream_openai(
             &base,
             "m",
-            vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
             GenOpts::default(),
             "pin_req_sse",
             &tx,
@@ -1436,7 +1486,7 @@ mod stream_tests {
         let err = chat_completion_stream_ollama(
             &base,
             "m",
-            vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
             GenOpts::default(),
             "pin_req_dead",
             &tx,
@@ -1468,7 +1518,7 @@ mod stream_tests {
         let err = chat_completion_stream_ollama(
             &format!("http://{}", addr),
             "nope",
-            vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
             GenOpts::default(),
             "pin_req_404",
             &tx,
@@ -1490,7 +1540,7 @@ mod stream_tests {
         chat_completion_stream_ollama(
             &base,
             "m",
-            vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
             GenOpts { temperature: Some(0.15), max_tokens: Some(64) },
             "pin_req_opts",
             &tx,
@@ -1554,5 +1604,95 @@ mod stream_tests {
 
         RETRY_AFTER_SECS.store(1, Ordering::SeqCst);
         assert_eq!(next_reconnect_delay(5), 5, "never reconnect FASTER than configured");
+    }
+
+    #[tokio::test]
+    async fn thinking_model_streams_reasoning_and_is_not_mistaken_for_a_hang() {
+        // These are the EXACT frames from production (muse-local:latest,
+        // captured 2026-08-12). `content` is empty for the whole reasoning
+        // phase and the text lives in `message.thinking` -- a field the
+        // daemon did not declare, so serde dropped it, every frame was
+        // skipped as "empty content", and a working model looked like a hung
+        // request: bytes arriving, nothing ever sent to the server.
+        let l1 = r#"{"model":"muse-local:latest","created_at":"2026-08-12T16:53:05.030030104Z","message":{"role":"assistant","content":"","thinking":"hi"},"done":false}"#;
+        let l2 = r#"{"model":"muse-local:latest","created_at":"2026-08-12T16:53:05.122590801Z","message":{"role":"assistant","content":"","thinking":"\n\n"},"done":false}"#;
+        let l3 = r#"{"model":"muse-local:latest","message":{"role":"assistant","content":"Hello","thinking":null},"done":false}"#;
+        let l4 = r#"{"model":"muse-local:latest","message":{"role":"assistant","content":"!"},"done":true,"prompt_eval_count":9,"eval_count":21}"#;
+
+        let base = serve_once(vec![format!("{}\n{}\n{}\n{}\n", l1, l2, l3, l4)]);
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+
+        let resp = chat_completion_stream_ollama(
+            &base,
+            "muse-local:latest",
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
+            GenOpts::default(),
+            "pin_req_thinking",
+            &tx,
+        )
+        .await
+        .expect("stream should succeed");
+
+        let chunks = drain(&mut rx);
+        assert_eq!(chunks.len(), 4, "2 thinking + 2 content deltas, none skipped");
+
+        let kinds: Vec<&str> = chunks.iter().map(|c| c["kind"].as_str().unwrap()).collect();
+        assert_eq!(kinds, vec!["thinking", "thinking", "content", "content"]);
+
+        let thought: String = chunks.iter()
+            .filter(|c| c["kind"] == "thinking")
+            .map(|c| c["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(thought, "hi\n\n");
+
+        let answer: String = chunks.iter()
+            .filter(|c| c["kind"] == "content")
+            .map(|c| c["delta"].as_str().unwrap())
+            .collect();
+        assert_eq!(answer, "Hello!");
+
+        // The final message keeps the two separate: the answer is the answer.
+        assert_eq!(resp.choices[0].message.content, "Hello!");
+        assert_eq!(resp.choices[0].message.thinking.as_deref(), Some("hi\n\n"));
+        assert_eq!(resp.usage.unwrap().completion_tokens, 21);
+    }
+
+    #[tokio::test]
+    async fn reasoning_with_no_answer_still_returns_the_reasoning() {
+        // A thinking model that exhausts its token budget mid-thought answers
+        // with nothing. That must come back as an empty answer WITH the
+        // reasoning attached -- not as an error, and not as silence.
+        let l1 = r#"{"message":{"role":"assistant","content":"","thinking":"still pondering"},"done":false}"#;
+        let l2 = r#"{"message":{"role":"assistant","content":""},"done":true,"prompt_eval_count":5,"eval_count":1024}"#;
+        let base = serve_once(vec![format!("{}\n{}\n", l1, l2)]);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let resp = chat_completion_stream_ollama(
+            &base, "m",
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
+            GenOpts::default(), "pin_req_nothought", &tx,
+        )
+        .await
+        .expect("no answer is not an error");
+
+        let chunks = drain(&mut rx);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["kind"], "thinking");
+        assert_eq!(resp.choices[0].message.content, "");
+        assert_eq!(resp.choices[0].message.thinking.as_deref(), Some("still pondering"));
+    }
+
+    #[test]
+    fn chunk_kind_is_on_the_wire_and_thinking_is_never_sent_upstream() {
+        let c = serde_json::to_value(ChunkMessage::content("r", 0, "x".into())).unwrap();
+        assert_eq!(c["kind"], "content");
+        let t = serde_json::to_value(ChunkMessage::thinking("r", 1, "y".into())).unwrap();
+        assert_eq!(t["kind"], "thinking");
+
+        // Requests we send to ollama must not grow a `thinking` key.
+        let m = serde_json::to_value(ChatMessage {
+            role: "user".into(), content: "hi".into(), thinking: None,
+        }).unwrap();
+        assert!(m.get("thinking").is_none(), "must be skipped when None: {}", m);
     }
 }
