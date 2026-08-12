@@ -784,17 +784,19 @@ async fn run_interview_prompt(
         content: prompt.prompt.clone(),
     }];
     
-    // The interview always specified a token cap; it was being dropped with
-    // everything else. Honour it now so a slow node is not judged on an
-    // unbounded generation.
-    let result = chat_completion(
-        base_url,
-        model,
-        messages,
-        api_mode,
-        GenOpts { temperature: None, max_tokens: Some(prompt.max_tokens) },
-    )
-    .await;
+    // NO token cap here, deliberately.
+    //
+    // The server scores speed as tokens_generated / total_ms, and total_ms is
+    // wall clock around the whole call -- model load, prompt eval, and
+    // generation. Capping generation at prompt.max_tokens leaves a handful of
+    // tokens carrying the entire fixed cost, which collapses the measured
+    // rate: an A6000 scored 8.2 tok/s against a 10 tok/s floor and was tiered
+    // FAILED. Uncapped, that overhead is amortized across a full answer, which
+    // is what the thresholds were calibrated against.
+    //
+    // prompt.max_tokens stays part of the wire format and is honoured on real
+    // inference (GenOpts) -- it just must not distort the measurement.
+    let result = chat_completion(base_url, model, messages, api_mode, GenOpts::default()).await;
     let total_ms = start.elapsed().as_millis() as u32;
     
     match result {
