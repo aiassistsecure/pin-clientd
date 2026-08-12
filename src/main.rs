@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, Semaphore};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
 /// Server-requested reconnect delay, in seconds. Set when the server tells us
@@ -588,6 +588,13 @@ async fn chat_completion_stream_ollama(
         options: opts.ollama_options(),
     };
 
+    // Tracing between "Starting inference" and silence. Production showed
+    // requests entering this function and never reaching either exit -- no
+    // completion, no error -- which narrows to exactly three places: the
+    // send, the first byte, or the stream loop. Each is now announced.
+    let t0 = std::time::Instant::now();
+    debug!("[{}] POST {} (stream)", request_id, url);
+
     let response = client
         .post(&url)
         .json(&request)
@@ -595,6 +602,8 @@ async fn chat_completion_stream_ollama(
         .send()
         .await
         .map_err(|e| format!("Ollama request failed: {}", e))?;
+
+    info!("[{}] ollama responded {} after {:?}", request_id, response.status(), t0.elapsed());
 
     if !response.status().is_success() {
         let status = response.status();
@@ -612,8 +621,14 @@ async fn chat_completion_stream_ollama(
     let mut completion_tokens = 0u32;
     let mut index = 0u32;
 
+    let mut reads = 0u32;
     while let Some(item) = stream.next().await {
         let bytes = item.map_err(|e| format!("Ollama stream error: {}", e))?;
+        reads += 1;
+        if reads == 1 {
+            info!("[{}] first body bytes after {:?} ({} bytes)",
+                request_id, t0.elapsed(), bytes.len());
+        }
         buf.push_str(&String::from_utf8_lossy(&bytes));
 
         while let Some(nl) = buf.find('\n') {
@@ -636,15 +651,26 @@ async fn chat_completion_stream_ollama(
                 if !msg.content.is_empty() {
                     content.push_str(&msg.content);
                     send_chunk(tx, request_id, index, msg.content)?;
+                    if index == 0 {
+                        info!("[{}] first token queued to server after {:?}",
+                            request_id, t0.elapsed());
+                    }
                     index += 1;
                 }
             }
             if chunk.done {
                 prompt_tokens = chunk.prompt_eval_count.unwrap_or(prompt_tokens);
                 completion_tokens = chunk.eval_count.unwrap_or(completion_tokens);
+                info!("[{}] ollama reported done after {:?} ({} prompt + {} eval tokens)",
+                    request_id, t0.elapsed(), prompt_tokens, completion_tokens);
             }
         }
     }
+
+    // Reaching here means the body ended. If `done` never arrived, say so --
+    // a truncated stream and a clean finish must not look identical.
+    info!("[{}] stream ended after {:?}: {} reads, {} chunks sent, {} chars",
+        request_id, t0.elapsed(), reads, index, content.len());
 
     Ok(OpenAIResponse {
         model: resolved_model,
