@@ -11,6 +11,11 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{error, info, warn};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+/// Server-requested reconnect delay, in seconds. Set when the server tells us
+/// to wait (INTERVIEW_FAILED carries retry_after_seconds); consumed once by
+/// the reconnect loop. Zero means "no request pending, use the configured
+/// delay".
+static RETRY_AFTER_SECS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Parser, Debug)]
@@ -68,6 +73,15 @@ fn default_reconnect_delay() -> u64 {
     5
 }
 
+/// The configured delay, unless the server asked for a longer one.
+///
+/// Consumes the pending request, so a single backoff is honoured once and the
+/// daemon returns to its normal cadence afterwards.
+fn next_reconnect_delay(configured: u64) -> u64 {
+    let requested = RETRY_AFTER_SECS.swap(0, Ordering::SeqCst);
+    configured.max(requested)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[allow(non_camel_case_types)]
@@ -82,6 +96,22 @@ enum ServerMessage {
     INFERENCE_REQUEST { request_id: String, payload: InferencePayload },
     INTERVIEW_REQUEST { interview_id: String, node_id: Option<String>, model: String, prompts: Vec<InterviewPrompt>, timeout_ms: u32 },
     INTERVIEW_COMPLETE { interview_id: String, node_id: Option<String>, tier: String, accuracy: f32, tokens_per_sec: f32, reason: String },
+    // The server sends this and then CLOSES the socket. Without the variant,
+    // serde rejected the frame, the backoff it carries was never read, and the
+    // daemon reconnected on its 5s timer into a server that hung up every
+    // time -- taking any in-flight inference down with it.
+    INTERVIEW_FAILED {
+        #[serde(default)]
+        node_id: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default)]
+        message: Option<String>,
+        #[serde(default)]
+        retry_after_seconds: Option<u64>,
+        #[serde(default)]
+        required_models: Option<Vec<String>>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -986,6 +1016,40 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                             info!("[INTERVIEW] Result sent to server for {}", node_label);
                                         }
                                     }
+                                    ServerMessage::INTERVIEW_FAILED {
+                                        node_id,
+                                        reason,
+                                        message,
+                                        retry_after_seconds,
+                                        required_models,
+                                    } => {
+                                        let node = node_id.unwrap_or_else(|| "node".into());
+                                        error!(
+                                            "[INTERVIEW] FAILED for {} ({}): {}",
+                                            node,
+                                            reason.unwrap_or_else(|| "unspecified".into()),
+                                            message.unwrap_or_else(|| "no detail given".into())
+                                        );
+                                        if let Some(models) = required_models {
+                                            error!(
+                                                "[INTERVIEW] Provide one of these models, or set \
+                                                 `interviewModel` in config.json: {}",
+                                                models.join(", ")
+                                            );
+                                        }
+                                        if let Some(secs) = retry_after_seconds {
+                                            // Honour it. The server closes the
+                                            // socket right after this frame, and
+                                            // reconnecting sooner just gets hung
+                                            // up on again.
+                                            RETRY_AFTER_SECS.store(secs, Ordering::SeqCst);
+                                            error!(
+                                                "[INTERVIEW] Server asked us to wait {}s before \
+                                                 reconnecting — backing off.",
+                                                secs
+                                            );
+                                        }
+                                    }
                                     ServerMessage::INTERVIEW_COMPLETE { interview_id: _, node_id, tier, accuracy, tokens_per_sec, reason } => {
                                         let node_label = node_id.as_deref().unwrap_or("operator");
                                         info!("=====================================");
@@ -1175,19 +1239,13 @@ async fn main() {
     
     while RUNNING.load(Ordering::SeqCst) {
         match run_connection(&config, args.threads).await {
-            Ok(_) => {
-                if RUNNING.load(Ordering::SeqCst) {
-                    info!("Reconnecting in {}s...", config.reconnect_delay_secs);
-                    tokio::time::sleep(Duration::from_secs(config.reconnect_delay_secs)).await;
-                }
-            }
-            Err(e) => {
-                error!("Connection error: {}", e);
-                if RUNNING.load(Ordering::SeqCst) {
-                    info!("Reconnecting in {}s...", config.reconnect_delay_secs);
-                    tokio::time::sleep(Duration::from_secs(config.reconnect_delay_secs)).await;
-                }
-            }
+            Ok(_) => {}
+            Err(e) => error!("Connection error: {}", e),
+        }
+        if RUNNING.load(Ordering::SeqCst) {
+            let delay = next_reconnect_delay(config.reconnect_delay_secs);
+            info!("Reconnecting in {}s...", delay);
+            tokio::time::sleep(Duration::from_secs(delay)).await;
         }
     }
 
@@ -1426,5 +1484,47 @@ mod stream_tests {
         let v = o.ollama_options().unwrap();
         assert_eq!(v["num_predict"], 8);
         assert!(v.get("temperature").is_none());
+    }
+
+    #[test]
+    fn interview_failed_is_parsed_and_carries_its_backoff() {
+        // The exact frame that broke the daemon in production: an unknown
+        // variant made serde reject it, so the 259s backoff was never seen and
+        // the daemon reconnected every 5s into a server that hung up each time.
+        let raw = r#"{"type":"INTERVIEW_FAILED","node_id":"node_2342e639-2a4","reason":"recently_failed","message":"Interview failed 40s ago. Please wait 4 more minutes before reconnecting, or upgrade your hardware.","retry_after_seconds":259}"#;
+        match serde_json::from_str::<ServerMessage>(raw).expect("must parse") {
+            ServerMessage::INTERVIEW_FAILED { retry_after_seconds, reason, .. } => {
+                assert_eq!(retry_after_seconds, Some(259));
+                assert_eq!(reason.as_deref(), Some("recently_failed"));
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn interview_failed_without_a_backoff_still_parses() {
+        // The no_interview_model form omits retry_after_seconds and adds
+        // required_models. Missing fields must not resurrect the parse error.
+        let raw = r#"{"type":"INTERVIEW_FAILED","node_id":"n","reason":"no_interview_model","message":"No interview model available.","required_models":["llama3:8b","mistral:7b"]}"#;
+        match serde_json::from_str::<ServerMessage>(raw).expect("must parse") {
+            ServerMessage::INTERVIEW_FAILED { retry_after_seconds, required_models, .. } => {
+                assert_eq!(retry_after_seconds, None);
+                assert_eq!(required_models.unwrap().len(), 2);
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn server_backoff_wins_over_the_configured_delay_but_only_once() {
+        RETRY_AFTER_SECS.store(0, Ordering::SeqCst);
+        assert_eq!(next_reconnect_delay(5), 5, "no request pending -> configured");
+
+        RETRY_AFTER_SECS.store(259, Ordering::SeqCst);
+        assert_eq!(next_reconnect_delay(5), 259, "server asked for longer -> honour it");
+        assert_eq!(next_reconnect_delay(5), 5, "consumed -> back to normal cadence");
+
+        RETRY_AFTER_SECS.store(1, Ordering::SeqCst);
+        assert_eq!(next_reconnect_delay(5), 5, "never reconnect FASTER than configured");
     }
 }
