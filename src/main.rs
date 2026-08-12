@@ -117,6 +117,41 @@ struct InferencePayload {
     messages: Vec<ChatMessage>,
     #[serde(default)]
     stream: bool,
+    // The server has always sent these; serde dropped them on the floor
+    // because they were not declared, so every PIN request ran at the
+    // backend's own defaults and the caller's temperature / max_tokens were
+    // silently ignored.
+    #[serde(default)]
+    temperature: Option<f64>,
+    #[serde(default)]
+    max_tokens: Option<u32>,
+}
+
+/// Generation knobs, threaded to whichever backend serves the request.
+#[derive(Debug, Clone, Copy, Default)]
+struct GenOpts {
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+}
+
+impl GenOpts {
+    /// Ollama takes these under `options`, and names the token cap
+    /// `num_predict`. Omitted entirely when nothing was requested, so the
+    /// model's own defaults still apply.
+    fn ollama_options(&self) -> Option<serde_json::Value> {
+        let mut map = serde_json::Map::new();
+        if let Some(t) = self.temperature {
+            map.insert("temperature".into(), serde_json::json!(t));
+        }
+        if let Some(n) = self.max_tokens {
+            map.insert("num_predict".into(), serde_json::json!(n));
+        }
+        if map.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Object(map))
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -242,6 +277,8 @@ struct OllamaChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -358,12 +395,17 @@ struct OpenAIChatRequest {
     messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
 }
 
 async fn chat_completion_ollama(
     base_url: &str,
     model: &str,
     messages: Vec<ChatMessage>,
+    opts: GenOpts,
 ) -> Result<OpenAIResponse, String> {
     let client = reqwest::Client::new();
     let url = format!("{}/api/chat", base_url.trim_end_matches('/'));
@@ -372,6 +414,7 @@ async fn chat_completion_ollama(
         model: model.to_string(),
         messages,
         stream: Some(false),
+        options: opts.ollama_options(),
     };
 
     let response = client
@@ -415,6 +458,7 @@ async fn chat_completion_openai(
     base_url: &str,
     model: &str,
     messages: Vec<ChatMessage>,
+    opts: GenOpts,
 ) -> Result<OpenAIResponse, String> {
     let client = reqwest::Client::new();
     let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
@@ -423,6 +467,8 @@ async fn chat_completion_openai(
         model: model.to_string(),
         messages,
         stream: Some(false),
+        temperature: opts.temperature,
+        max_tokens: opts.max_tokens,
     };
 
     let response = client
@@ -450,10 +496,11 @@ async fn chat_completion(
     model: &str,
     messages: Vec<ChatMessage>,
     api_mode: &str,
+    opts: GenOpts,
 ) -> Result<OpenAIResponse, String> {
     match api_mode {
-        "openai" => chat_completion_openai(base_url, model, messages).await,
-        _ => chat_completion_ollama(base_url, model, messages).await,
+        "openai" => chat_completion_openai(base_url, model, messages, opts).await,
+        _ => chat_completion_ollama(base_url, model, messages, opts).await,
     }
 }
 
@@ -468,14 +515,15 @@ async fn chat_completion_stream(
     model: &str,
     messages: Vec<ChatMessage>,
     api_mode: &str,
+    opts: GenOpts,
     request_id: &str,
     tx: &mpsc::UnboundedSender<String>,
 ) -> Result<OpenAIResponse, String> {
     match api_mode {
         "openai" => {
-            chat_completion_stream_openai(base_url, model, messages, request_id, tx).await
+            chat_completion_stream_openai(base_url, model, messages, opts, request_id, tx).await
         }
-        _ => chat_completion_stream_ollama(base_url, model, messages, request_id, tx).await,
+        _ => chat_completion_stream_ollama(base_url, model, messages, opts, request_id, tx).await,
     }
 }
 
@@ -496,6 +544,7 @@ async fn chat_completion_stream_ollama(
     base_url: &str,
     model: &str,
     messages: Vec<ChatMessage>,
+    opts: GenOpts,
     request_id: &str,
     tx: &mpsc::UnboundedSender<String>,
 ) -> Result<OpenAIResponse, String> {
@@ -506,6 +555,7 @@ async fn chat_completion_stream_ollama(
         model: model.to_string(),
         messages,
         stream: Some(true),
+        options: opts.ollama_options(),
     };
 
     let response = client
@@ -588,6 +638,7 @@ async fn chat_completion_stream_openai(
     base_url: &str,
     model: &str,
     messages: Vec<ChatMessage>,
+    opts: GenOpts,
     request_id: &str,
     tx: &mpsc::UnboundedSender<String>,
 ) -> Result<OpenAIResponse, String> {
@@ -599,12 +650,18 @@ async fn chat_completion_stream_openai(
     // support it ignore the field, and usage stays zero -- the same outcome as
     // a missing `usage` on the non-streaming path today. Counts are never
     // estimated: billing on a guess would be worse than billing on zero.
-    let request = serde_json::json!({
+    let mut request = serde_json::json!({
         "model": model,
         "messages": messages,
         "stream": true,
         "stream_options": { "include_usage": true },
     });
+    if let Some(t) = opts.temperature {
+        request["temperature"] = serde_json::json!(t);
+    }
+    if let Some(n) = opts.max_tokens {
+        request["max_tokens"] = serde_json::json!(n);
+    }
 
     let response = client
         .post(&url)
@@ -697,7 +754,17 @@ async fn run_interview_prompt(
         content: prompt.prompt.clone(),
     }];
     
-    let result = chat_completion(base_url, model, messages, api_mode).await;
+    // The interview always specified a token cap; it was being dropped with
+    // everything else. Honour it now so a slow node is not judged on an
+    // unbounded generation.
+    let result = chat_completion(
+        base_url,
+        model,
+        messages,
+        api_mode,
+        GenOpts { temperature: None, max_tokens: Some(prompt.max_tokens) },
+    )
+    .await;
     let total_ms = start.elapsed().as_millis() as u32;
     
     match result {
@@ -942,6 +1009,10 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                         let model = payload.model.clone();
                                         let messages = payload.messages;
                                         let stream = payload.stream;
+                                        let opts = GenOpts {
+                                            temperature: payload.temperature,
+                                            max_tokens: payload.max_tokens,
+                                        };
 
                                         info!("[#{}] Inference request: {} ({}) via {}{} [queued]",
                                             count, request_id, model, mode,
@@ -956,11 +1027,13 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                             info!("[#{}] Starting inference for {}", count, request_id);
                                             let result = if stream {
                                                 chat_completion_stream(
-                                                    &uri, &model, messages, &mode, &request_id, &tx,
+                                                    &uri, &model, messages, &mode, opts,
+                                                    &request_id, &tx,
                                                 )
                                                 .await
                                             } else {
-                                                chat_completion(&uri, &model, messages, &mode).await
+                                                chat_completion(&uri, &model, messages, &mode, opts)
+                                                    .await
                                             };
 
                                             let response = match result {
@@ -1127,6 +1200,30 @@ mod stream_tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    /// Capture the request body a caller sent, alongside serving a response.
+    fn serve_once_capturing(pieces: Vec<String>) -> (String, std::sync::mpsc::Receiver<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (btx, brx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = req.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            let _ = btx.send(body);
+            let full: String = pieces.concat();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n",
+                full.len()
+            );
+            sock.write_all(head.as_bytes()).unwrap();
+            sock.write_all(full.as_bytes()).unwrap();
+        });
+        (format!("http://{}", addr), brx)
+    }
+
     /// Serve one HTTP response whose body is written in the given pieces.
     /// Splitting a JSON line across pieces is the whole point: a naive
     /// parser that treats each network read as a complete line loses tokens.
@@ -1180,6 +1277,7 @@ mod stream_tests {
             &base,
             "muse-local:latest",
             vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            GenOpts::default(),
             "pin_req_test",
             &tx,
         )
@@ -1224,6 +1322,7 @@ mod stream_tests {
             &base,
             "m",
             vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            GenOpts::default(),
             "pin_req_sse",
             &tx,
         )
@@ -1252,6 +1351,7 @@ mod stream_tests {
             &base,
             "m",
             vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            GenOpts::default(),
             "pin_req_dead",
             &tx,
         )
@@ -1283,11 +1383,48 @@ mod stream_tests {
             &format!("http://{}", addr),
             "nope",
             vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            GenOpts::default(),
             "pin_req_404",
             &tx,
         )
         .await
         .expect_err("404 must be an error");
         assert!(err.contains("404"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn generation_options_reach_ollama() {
+        // Regression: InferencePayload did not declare temperature/max_tokens,
+        // so serde dropped them and every request silently ran at the
+        // backend's defaults -- the playground's slider did nothing.
+        let done = r#"{"message":{"role":"assistant","content":"ok"},"done":true,"prompt_eval_count":1,"eval_count":1}"#;
+        let (base, body_rx) = serve_once_capturing(vec![format!("{}\n", done)]);
+
+        let (tx, _rx) = mpsc::unbounded_channel::<String>();
+        chat_completion_stream_ollama(
+            &base,
+            "m",
+            vec![ChatMessage { role: "user".into(), content: "hi".into() }],
+            GenOpts { temperature: Some(0.15), max_tokens: Some(64) },
+            "pin_req_opts",
+            &tx,
+        )
+        .await
+        .expect("stream ok");
+
+        let body = body_rx.recv_timeout(Duration::from_secs(5)).expect("request body");
+        let sent: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(sent["options"]["temperature"], 0.15);
+        assert_eq!(sent["options"]["num_predict"], 64);
+        assert_eq!(sent["stream"], true);
+    }
+
+    #[test]
+    fn empty_options_are_omitted_so_model_defaults_apply() {
+        assert!(GenOpts::default().ollama_options().is_none());
+        let o = GenOpts { temperature: None, max_tokens: Some(8) };
+        let v = o.ollama_options().unwrap();
+        assert_eq!(v["num_predict"], 8);
+        assert!(v.get("temperature").is_none());
     }
 }
