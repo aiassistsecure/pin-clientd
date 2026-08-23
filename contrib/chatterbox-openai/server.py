@@ -16,8 +16,13 @@ authorized — do not clone anyone without documented permission.
 
 Run on the GPU box:
 
-    pip install chatterbox-tts fastapi uvicorn
+    pip install chatterbox-tts fastapi uvicorn "setuptools<81"
     python3 server.py --device cuda --port 8880 --voices-dir ./voices
+
+The setuptools pin matters: chatterbox's watermarker (resemble-perth) imports
+pkg_resources, which setuptools >= 81 removed. Without the pin, perth silently
+exports PerthImplicitWatermarker = None and model load dies with
+"'NoneType' object is not callable".
 
 Smoke test:
 
@@ -107,6 +112,18 @@ def main():
     ap.add_argument("--voices-dir", default="./voices")
     args = ap.parse_args()
     VOICES_DIR = args.voices_dir
+
+    # Preflight: perth (the audio watermarker) swallows its own ImportError
+    # and exports None, which chatterbox then calls. Catch it here with the
+    # actual fix instead of dying with "'NoneType' object is not callable".
+    import perth
+
+    if perth.PerthImplicitWatermarker is None:
+        raise SystemExit(
+            "[boot] perth.PerthImplicitWatermarker is None -- pkg_resources is "
+            "missing (setuptools >= 81 removed it).\n"
+            "[boot] Fix: pip install \"setuptools<81\"  then rerun."
+        )
 
     from chatterbox.tts_turbo import ChatterboxTurboTTS
 

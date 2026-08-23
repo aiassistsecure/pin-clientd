@@ -435,7 +435,7 @@ A ready-to-run Chatterbox Turbo backend lives in
 [`contrib/chatterbox-openai/`](contrib/chatterbox-openai/server.py):
 
 ```bash
-pip install chatterbox-tts fastapi uvicorn
+pip install chatterbox-tts fastapi uvicorn "setuptools<81"
 python3 contrib/chatterbox-openai/server.py --device cuda --port 8880
 
 curl -s http://127.0.0.1:8880/v1/audio/speech \
