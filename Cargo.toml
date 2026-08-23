@@ -1,6 +1,6 @@
 [package]
 name = "pin-clientd"
-version = "2.3.0"
+version = "2.4.0"
 description = "PIN Client Daemon - Headless P2P Inference Network Operator"
 authors = ["AiAssist Secure"]
 license = "MIT"

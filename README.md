@@ -406,3 +406,43 @@ journalctl -u pin-clientd -f
 ## License
 
 MIT License - AiAssist Secure
+
+## Text-to-Speech nodes (v2.4.0+)
+
+A node can serve speech alongside (or instead of) chat. Point `ttsUri` at any
+OpenAI-compatible TTS server (`POST {ttsUri}/v1/audio/speech`) and list the
+voices' models in `ttsModels`:
+
+```json
+{
+  "alias": "A6000-1",
+  "inferenceUri": "http://localhost:11434",
+  "apiMode": "ollama",
+  "region": "us-east",
+  "capacity": 10,
+  "ttsUri": "http://127.0.0.1:8880",
+  "ttsModels": ["chatterbox-turbo"]
+}
+```
+
+TTS models register with a `tts:` prefix (e.g. `tts:chatterbox-turbo`) so the
+server can route speech separately from chat. The daemon answers
+`TTS_REQUEST` frames with a single `TTS_RESPONSE` carrying base64 audio, or
+`TTS_ERROR` — a server that never sends TTS frames sees no behavior change,
+and legacy configs without `ttsUri` parse unchanged.
+
+A ready-to-run Chatterbox Turbo backend lives in
+[`contrib/chatterbox-openai/`](contrib/chatterbox-openai/server.py):
+
+```bash
+pip install chatterbox-tts fastapi uvicorn
+python3 contrib/chatterbox-openai/server.py --device cuda --port 8880
+
+curl -s http://127.0.0.1:8880/v1/audio/speech \
+  -H 'content-type: application/json' \
+  -d '{"model":"chatterbox-turbo","input":"Welcome to the room.","response_format":"wav"}' \
+  -o hello.wav
+```
+
+Voice references are wav files in `--voices-dir` (`mark.wav` → voice `"mark"`).
+Only use reference audio you are authorized to clone.
