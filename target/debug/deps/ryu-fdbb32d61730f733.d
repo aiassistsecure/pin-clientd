@@ -1,0 +1,16 @@
+/agent/workspace/pin-clientd/target/debug/deps/ryu-fdbb32d61730f733.d: /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/lib.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/buffer/mod.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/common.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/d2s.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/d2s_full_table.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/d2s_intrinsics.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/digit_table.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/f2s.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/f2s_intrinsics.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/pretty/mod.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/pretty/exponent.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/pretty/mantissa.rs
+
+/agent/workspace/pin-clientd/target/debug/deps/libryu-fdbb32d61730f733.rmeta: /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/lib.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/buffer/mod.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/common.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/d2s.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/d2s_full_table.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/d2s_intrinsics.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/digit_table.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/f2s.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/f2s_intrinsics.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/pretty/mod.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/pretty/exponent.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/pretty/mantissa.rs
+
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/lib.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/buffer/mod.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/common.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/d2s.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/d2s_full_table.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/d2s_intrinsics.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/digit_table.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/f2s.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/f2s_intrinsics.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/pretty/mod.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/pretty/exponent.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ryu-1.0.23/src/pretty/mantissa.rs:

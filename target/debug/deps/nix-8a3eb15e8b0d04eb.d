@@ -1,0 +1,17 @@
+/agent/workspace/pin-clientd/target/debug/deps/nix-8a3eb15e8b0d04eb.d: /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/lib.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/macros.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/errno.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/fcntl.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/mod.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/signal.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/sysinfo.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/time.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/unistd.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/prctl.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/signalfd.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/wait.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/spawn.rs
+
+/agent/workspace/pin-clientd/target/debug/deps/libnix-8a3eb15e8b0d04eb.rmeta: /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/lib.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/macros.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/errno.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/fcntl.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/mod.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/signal.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/sysinfo.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/time.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/unistd.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/prctl.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/signalfd.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/wait.rs /agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/spawn.rs
+
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/lib.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/macros.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/errno.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/fcntl.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/mod.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/signal.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/sysinfo.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/time.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/unistd.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/prctl.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/signalfd.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/sys/wait.rs:
+/agent/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/nix-0.31.3/src/spawn.rs:
