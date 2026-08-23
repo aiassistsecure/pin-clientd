@@ -21,7 +21,7 @@ static TOTAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
 #[derive(Parser, Debug)]
 #[command(name = "pin-clientd")]
 #[command(about = "PIN Client Daemon - Headless P2P Inference Network Node")]
-#[command(version = "2.3.0")]
+#[command(version = "2.4.0")]
 struct Args {
     #[arg(short, long, default_value = "config.json")]
     config: PathBuf,
@@ -45,6 +45,14 @@ struct NodeConfig {
     price_per_thousand_tokens: f64,
     #[serde(default)]
     interview_model: Option<String>,
+    /// Base URL of an OpenAI-compatible text-to-speech server
+    /// (POST {ttsUri}/v1/audio/speech). When set, this node also serves TTS.
+    #[serde(default)]
+    tts_uri: Option<String>,
+    /// TTS model names to advertise. Registered with a "tts:" prefix so the
+    /// server can tell speech models from chat models without a schema change.
+    #[serde(default)]
+    tts_models: Option<Vec<String>>,
 }
 
 fn default_price() -> f64 {
@@ -94,6 +102,10 @@ enum ServerMessage {
     REGISTER_NODE_ACK { node_id: String, alias: String, models: Vec<String>, created: bool, message: String },
     UPDATE_WALLET_ACK { success: bool, message: String },
     INFERENCE_REQUEST { request_id: String, payload: InferencePayload },
+    /// Text-to-speech. Purely ADDITIVE, same family as INFERENCE_REQUEST: a
+    /// server that never sends it changes nothing, and a daemon without a
+    /// ttsUri answers with TTS_ERROR instead of hanging the request.
+    TTS_REQUEST { request_id: String, payload: TtsPayload },
     INTERVIEW_REQUEST { interview_id: String, node_id: Option<String>, model: String, prompts: Vec<InterviewPrompt>, timeout_ms: u32 },
     INTERVIEW_COMPLETE { interview_id: String, node_id: Option<String>, tier: String, accuracy: f32, tokens_per_sec: f32, reason: String },
     // The server sends this and then CLOSES the socket. Without the variant,
@@ -155,6 +167,29 @@ struct InferencePayload {
     temperature: Option<f64>,
     #[serde(default)]
     max_tokens: Option<u32>,
+}
+
+/// OpenAI-compatible speech request, forwarded to a node's TTS backend as
+/// POST /v1/audio/speech. `model` arrives WITHOUT the "tts:" registration
+/// prefix — that prefix is routing metadata, not a model name.
+#[derive(Debug, Serialize, Deserialize)]
+struct TtsPayload {
+    model: String,
+    input: String,
+    #[serde(default = "default_voice")]
+    voice: String,
+    #[serde(default = "default_audio_format")]
+    response_format: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speed: Option<f64>,
+}
+
+fn default_voice() -> String {
+    "default".to_string()
+}
+
+fn default_audio_format() -> String {
+    "mp3".to_string()
 }
 
 /// Generation knobs, threaded to whichever backend serves the request.
@@ -846,6 +881,68 @@ async fn chat_completion_stream_openai(
     })
 }
 
+/// Render speech through an OpenAI-compatible TTS server.
+/// Returns (audio bytes, content type). Non-2xx is surfaced, never swallowed.
+async fn tts_speech(base_url: &str, payload: &TtsPayload) -> Result<(Vec<u8>, String), String> {
+    let client = reqwest::Client::new();
+    let url = format!("{}/v1/audio/speech", base_url.trim_end_matches('/'));
+
+    let t0 = std::time::Instant::now();
+    let response = client
+        .post(&url)
+        .json(payload)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|e| format!("TTS request failed: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("TTS error {}: {}", status, body));
+    }
+
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("TTS body read failed: {}", e))?;
+
+    if bytes.is_empty() {
+        return Err("TTS server returned an empty body".to_string());
+    }
+
+    info!(
+        "TTS rendered {} bytes ({}) in {:?}",
+        bytes.len(),
+        content_type,
+        t0.elapsed()
+    );
+    Ok((bytes.to_vec(), content_type))
+}
+
+/// Standard base64 (RFC 4648, with padding). Hand-rolled to keep the daemon's
+/// dependency footprint unchanged — audio frames are the only binary payload.
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { TABLE[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 async fn run_interview_prompt(
     base_url: &str,
     model: &str,
@@ -1015,13 +1112,25 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                                 node_config.alias, node_config.region, node_config.capacity, 
                                                 node_config.inference_uri, node_config.api_mode);
                                             
-                                            let models = match get_models(&node_config.inference_uri, &node_config.api_mode).await {
+                                            let mut models = match get_models(&node_config.inference_uri, &node_config.api_mode).await {
                                                 Ok(m) => m,
                                                 Err(e) => {
                                                     error!("Failed to get models for {} ({}): {}", node_config.alias, node_config.api_mode, e);
                                                     vec![]
                                                 }
                                             };
+
+                                            // Advertise speech models with a "tts:" prefix so the
+                                            // server can route by capability without a schema change.
+                                            if node_config.tts_uri.is_some() {
+                                                for m in node_config.tts_models.clone().unwrap_or_default() {
+                                                    let tagged = format!("tts:{}", m);
+                                                    if !models.contains(&tagged) {
+                                                        info!("Node {} advertising TTS model: {}", node_config.alias, tagged);
+                                                        models.push(tagged);
+                                                    }
+                                                }
+                                            }
                                             
                                             if models.is_empty() {
                                                 warn!("No models found for node {} - check endpoint {}", node_config.alias, node_config.inference_uri);
@@ -1141,6 +1250,69 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                         if tier == "failed" {
                                             error!("Node {} failed quality check - connection will be closed", node_label);
                                         }
+                                    }
+                                    ServerMessage::TTS_REQUEST { request_id, payload } => {
+                                        let count = TOTAL_REQUESTS.fetch_add(1, Ordering::SeqCst) + 1;
+
+                                        // First node that declares a TTS backend serves speech.
+                                        let tts_uri = config.nodes.iter().find_map(|n| n.tts_uri.clone());
+
+                                        info!("[#{}] TTS request: {} (model {}, voice {}, {} chars) [queued]",
+                                            count, request_id, payload.model, payload.voice, payload.input.len());
+
+                                        let sem = semaphore.clone();
+                                        let tx = tx.clone();
+
+                                        tokio::spawn(async move {
+                                            let _permit = sem.acquire().await.expect("semaphore closed");
+
+                                            let response = match tts_uri {
+                                                None => {
+                                                    error!("[#{}] TTS request but no node has a ttsUri configured", count);
+                                                    ClientMessage {
+                                                        msg_type: "TTS_ERROR".to_string(),
+                                                        request_id: Some(request_id),
+                                                        result: None,
+                                                        error: Some("no TTS backend configured on this operator".to_string()),
+                                                        models: None,
+                                                    }
+                                                }
+                                                Some(uri) => match tts_speech(&uri, &payload).await {
+                                                    Ok((bytes, content_type)) => {
+                                                        info!("[#{}] TTS completed ({} bytes)", count, bytes.len());
+                                                        ClientMessage {
+                                                            msg_type: "TTS_RESPONSE".to_string(),
+                                                            request_id: Some(request_id),
+                                                            result: Some(serde_json::json!({
+                                                                "model": payload.model,
+                                                                "voice": payload.voice,
+                                                                "format": payload.response_format,
+                                                                "content_type": content_type,
+                                                                "bytes": bytes.len(),
+                                                                "audio_b64": base64_encode(&bytes),
+                                                            })),
+                                                            error: None,
+                                                            models: None,
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        error!("[#{}] TTS failed: {}", count, e);
+                                                        ClientMessage {
+                                                            msg_type: "TTS_ERROR".to_string(),
+                                                            request_id: Some(request_id),
+                                                            result: None,
+                                                            error: Some(e),
+                                                            models: None,
+                                                        }
+                                                    }
+                                                },
+                                            };
+
+                                            if let Ok(json) = serde_json::to_string(&response) {
+                                                let _ = tx.send(json);
+                                                info!("[#{}] TTS response queued for send", count);
+                                            }
+                                        });
                                     }
                                     ServerMessage::INFERENCE_REQUEST { request_id, payload } => {
                                         let count = TOTAL_REQUESTS.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1680,6 +1852,163 @@ mod stream_tests {
         assert_eq!(chunks[0]["kind"], "thinking");
         assert_eq!(resp.choices[0].message.content, "");
         assert_eq!(resp.choices[0].message.thinking.as_deref(), Some("still pondering"));
+    }
+
+    #[test]
+    fn base64_matches_rfc4648_vectors() {
+        // The RFC 4648 §10 test vectors — the encoder either matches all of
+        // these or it corrupts every audio frame it ships.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        // Binary, not just ASCII: all 256 byte values round through the table.
+        let all: Vec<u8> = (0u8..=255).collect();
+        let enc = base64_encode(&all);
+        assert_eq!(enc.len(), 344);
+        assert!(enc.ends_with("=="), "256 % 3 == 1 -> two pad chars");
+    }
+
+    #[test]
+    fn tts_request_parses_with_and_without_optional_fields() {
+        // Full form.
+        let raw = r#"{"type":"TTS_REQUEST","request_id":"tts_1","payload":{"model":"chatterbox-turbo","input":"Welcome to the room.","voice":"ris","response_format":"wav","speed":1.1}}"#;
+        match serde_json::from_str::<ServerMessage>(raw).expect("must parse") {
+            ServerMessage::TTS_REQUEST { request_id, payload } => {
+                assert_eq!(request_id, "tts_1");
+                assert_eq!(payload.voice, "ris");
+                assert_eq!(payload.response_format, "wav");
+                assert_eq!(payload.speed, Some(1.1));
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+        // Minimal form: defaults fill in, and a missing speed is never
+        // serialized upstream as null.
+        let raw = r#"{"type":"TTS_REQUEST","request_id":"tts_2","payload":{"model":"chatterbox-turbo","input":"hi"}}"#;
+        match serde_json::from_str::<ServerMessage>(raw).expect("must parse") {
+            ServerMessage::TTS_REQUEST { payload, .. } => {
+                assert_eq!(payload.voice, "default");
+                assert_eq!(payload.response_format, "mp3");
+                let sent = serde_json::to_value(&payload).unwrap();
+                assert!(sent.get("speed").is_none(), "None speed must be omitted: {}", sent);
+            }
+            other => panic!("wrong variant: {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn tts_round_trip_posts_openai_shape_and_returns_bytes() {
+        // A local "TTS server" that captures the request and returns audio-ish
+        // bytes with a content type. Binary body, NOT valid UTF-8 — the
+        // response path must never lossy-convert it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (btx, brx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 8192];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = req.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+            let _ = btx.send(body);
+            let audio: Vec<u8> = vec![0xFF, 0xF3, 0x00, 0x01, 0xFE, 0x80]; // not UTF-8
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                audio.len()
+            );
+            sock.write_all(head.as_bytes()).unwrap();
+            sock.write_all(&audio).unwrap();
+        });
+
+        let payload = TtsPayload {
+            model: "chatterbox-turbo".into(),
+            input: "Welcome to the room. It's invite-only.".into(),
+            voice: "mark".into(),
+            response_format: "mp3".into(),
+            speed: None,
+        };
+        let (bytes, content_type) = tts_speech(&format!("http://{}", addr), &payload)
+            .await
+            .expect("tts should succeed");
+
+        assert_eq!(bytes, vec![0xFF, 0xF3, 0x00, 0x01, 0xFE, 0x80]);
+        assert_eq!(content_type, "audio/mpeg");
+
+        // What went over the wire to the backend is the OpenAI speech shape.
+        let sent_body = brx.recv_timeout(Duration::from_secs(5)).expect("request body");
+        let sent: serde_json::Value = serde_json::from_str(&sent_body).expect("json body");
+        assert_eq!(sent["model"], "chatterbox-turbo");
+        assert_eq!(sent["voice"], "mark");
+        assert_eq!(sent["input"], "Welcome to the room. It's invite-only.");
+        assert_eq!(sent["response_format"], "mp3");
+
+        // And the frame the daemon would send upstream is one JSON text frame.
+        assert_eq!(base64_encode(&bytes), "//MAAf6A");
+    }
+
+    #[tokio::test]
+    async fn tts_backend_errors_are_surfaced() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut discard = [0u8; 4096];
+            let _ = sock.read(&mut discard);
+            let body = "voice not found";
+            let _ = sock.write_all(format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            ).as_bytes());
+        });
+        let payload = TtsPayload {
+            model: "m".into(), input: "x".into(),
+            voice: "ghost".into(), response_format: "mp3".into(), speed: None,
+        };
+        let err = tts_speech(&format!("http://{}", addr), &payload)
+            .await
+            .expect_err("404 must be an error");
+        assert!(err.contains("404"), "got: {}", err);
+        assert!(err.contains("voice not found"), "backend detail must survive: {}", err);
+    }
+
+    #[tokio::test]
+    async fn tts_empty_body_is_an_error_not_a_silent_empty_clip() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut discard = [0u8; 4096];
+            let _ = sock.read(&mut discard);
+            let _ = sock.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            );
+        });
+        let payload = TtsPayload {
+            model: "m".into(), input: "x".into(),
+            voice: "default".into(), response_format: "mp3".into(), speed: None,
+        };
+        let err = tts_speech(&format!("http://{}", addr), &payload)
+            .await
+            .expect_err("empty audio must be an error");
+        assert!(err.contains("empty"), "got: {}", err);
+    }
+
+    #[test]
+    fn node_config_without_tts_fields_still_parses() {
+        // Every existing operator config in the field lacks ttsUri/ttsModels.
+        // They must keep parsing unchanged.
+        let raw = r#"{"alias":"gpu1","inferenceUri":"http://127.0.0.1:11434","apiMode":"ollama","region":"us-east","capacity":4}"#;
+        let node: NodeConfig = serde_json::from_str(raw).expect("legacy config must parse");
+        assert!(node.tts_uri.is_none());
+        assert!(node.tts_models.is_none());
+
+        let raw = r#"{"alias":"gpu1","inferenceUri":"http://127.0.0.1:11434","apiMode":"ollama","region":"us-east","capacity":4,"ttsUri":"http://127.0.0.1:8880","ttsModels":["chatterbox-turbo"]}"#;
+        let node: NodeConfig = serde_json::from_str(raw).expect("tts config must parse");
+        assert_eq!(node.tts_uri.as_deref(), Some("http://127.0.0.1:8880"));
+        assert_eq!(node.tts_models.unwrap(), vec!["chatterbox-turbo"]);
     }
 
     #[test]
