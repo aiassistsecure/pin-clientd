@@ -47,8 +47,11 @@ pub async fn connect_downlink(
         .to_string();
     let signature = compute_signature(&config.client_id, &timestamp, &config.api_secret);
 
+    // No total timeout: this is a persistent downlink. A 60s deadline would
+    // close an otherwise healthy stream the first time inference ran long.
+    // Connect still has a bound so a hung handshake cannot stall forever.
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_secs(15))
         .build()
         .map_err(|e| format!("http client: {e}"))?;
 
@@ -255,6 +258,48 @@ pub async fn inference_chunk(
         stream_token,
         "chunk",
         &ChunkBody { request_id, index, delta, kind },
+    )
+    .await
+}
+
+/// Register or update a node over HTTP. Mirrors the WebSocket REGISTER_NODE body.
+#[allow(clippy::too_many_arguments)]
+pub async fn register_node(
+    config: &Config,
+    stream_token: &str,
+    alias: &str,
+    models: &[String],
+    capacity: u32,
+    region: &str,
+    price_per_thousand_tokens: f64,
+    interview_model: Option<&str>,
+    api_mode: &str,
+) -> Result<(), String> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct RegisterBody<'a> {
+        alias: &'a str,
+        models: &'a [String],
+        capacity: u32,
+        region: &'a str,
+        price_per_thousand_tokens: f64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        interview_model: Option<&'a str>,
+        api_mode: &'a str,
+    }
+    post_uplink(
+        config,
+        stream_token,
+        "register",
+        &RegisterBody {
+            alias,
+            models,
+            capacity,
+            region,
+            price_per_thousand_tokens,
+            interview_model,
+            api_mode,
+        },
     )
     .await
 }
