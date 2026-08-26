@@ -64,15 +64,19 @@ fn default_price() -> f64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
-    client_id: String,
-    api_secret: String,
-    nodes: Vec<NodeConfig>,
+    pub client_id: String,
+    pub api_secret: String,
+    pub(crate) nodes: Vec<NodeConfig>,
     #[serde(default)]
-    payout_address: Option<String>,
+    pub payout_address: Option<String>,
     #[serde(default = "default_server_url")]
-    server_url: String,
+    pub server_url: String,
     #[serde(default = "default_reconnect_delay")]
-    reconnect_delay_secs: u64,
+    pub reconnect_delay_secs: u64,
+    /// "sse" (default) or "ws". SSE is the live operator transport; WebSocket
+    /// stays as a compatibility fallback.
+    #[serde(default = "default_transport")]
+    pub transport: String,
 }
 
 fn default_server_url() -> String {
@@ -81,6 +85,10 @@ fn default_server_url() -> String {
 
 fn default_reconnect_delay() -> u64 {
     5
+}
+
+fn default_transport() -> String {
+    "sse".to_string()
 }
 
 /// The configured delay, unless the server asked for a longer one.
@@ -1039,7 +1047,332 @@ async fn execute_interview(
     }
 }
 
+/// Dispatch one SSE event through the same handlers the WebSocket path uses.
+/// Returns Err only when the connection itself must die.
+async fn handle_sse_event(
+    config: &Config,
+    event: sse::SseEvent,
+    node_endpoints: &std::collections::HashMap<String, (String, String)>,
+    semaphore: &Arc<Semaphore>,
+    tx: &mpsc::UnboundedSender<String>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let text = event.payload();
+    let server_msg = match serde_json::from_str::<ServerMessage>(text) {
+        Ok(msg) => msg,
+        Err(e) => {
+            warn!("Failed to parse SSE event {}: {} — {}", event.event_type, e, text);
+            return Ok(());
+        }
+    };
+    match server_msg {
+        ServerMessage::AUTH_SUCCESS { operator_id, .. } => {
+            info!("Authenticated over SSE! Operator: {}", operator_id);
+        }
+        ServerMessage::REGISTER_NODE_ACK { node_id, alias, models, created, message } => {
+            let status = if created { "registered" } else { "updated" };
+            info!("[NODE] {} {} (ID: {}) with {} models", status.to_uppercase(), alias, node_id, models.len());
+            info!("[NODE] {}", message);
+        }
+        ServerMessage::ERROR { message } => {
+            error!("Server error: {}", message);
+            return Err(message.into());
+        }
+        ServerMessage::HEARTBEAT_ACK | ServerMessage::MODEL_LIST_ACK | ServerMessage::PING => {}
+        ServerMessage::UPDATE_WALLET_ACK { success, message } => {
+            if success { info!("[WALLET] {}", message); } else { warn!("[WALLET] Failed: {}", message); }
+        }
+        ServerMessage::INTERVIEW_REQUEST { interview_id, node_id, model, prompts, timeout_ms: _ } => {
+            let node_label = node_id.as_deref().unwrap_or("operator").to_string();
+            info!("[INTERVIEW] Received interview for {} - model {} ({} prompts)", node_label, model, prompts.len());
+            let (uri, mode) = match node_endpoints.get(&node_label) {
+                Some((u, m)) => (u.clone(), m.clone()),
+                None => {
+                    let first = config.nodes.first().unwrap();
+                    (first.inference_uri.clone(), first.api_mode.clone())
+                }
+            };
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let interview_result = execute_interview(&uri, &interview_id, &model, prompts, &mode).await;
+                match serde_json::to_string(&interview_result) {
+                    Ok(json) => {
+                        if tx.send(json).is_err() {
+                            error!("[INTERVIEW] Failed to queue result for {}: writer closed", node_label);
+                        } else {
+                            info!("[INTERVIEW] Result queued for server for {}", node_label);
+                        }
+                    }
+                    Err(e) => error!("[INTERVIEW] Failed to encode result for {}: {}", node_label, e),
+                }
+            });
+        }
+        ServerMessage::INTERVIEW_FAILED { node_id, reason, message, retry_after_seconds, required_models } => {
+            let node = node_id.unwrap_or_else(|| "node".into());
+            error!(
+                "[INTERVIEW] FAILED for {} ({}): {}",
+                node,
+                reason.unwrap_or_else(|| "unspecified".into()),
+                message.unwrap_or_else(|| "no detail given".into())
+            );
+            if let Some(models) = required_models {
+                error!("[INTERVIEW] Provide one of these models, or set `interviewModel` in config.json: {}", models.join(", "));
+            }
+            if let Some(secs) = retry_after_seconds {
+                RETRY_AFTER_SECS.store(secs, Ordering::SeqCst);
+                error!("[INTERVIEW] Server asked us to wait {}s before reconnecting — backing off.", secs);
+            }
+        }
+        ServerMessage::INTERVIEW_COMPLETE { interview_id: _, node_id, tier, accuracy, tokens_per_sec, reason } => {
+            let node_label = node_id.as_deref().unwrap_or("operator");
+            info!("=====================================");
+            info!("[INTERVIEW] Quality Tier Assigned for {}!", node_label);
+            info!("  Tier: {}", tier.to_uppercase());
+            info!("  Accuracy: {:.1}%", accuracy);
+            info!("  Speed: {:.1} tokens/sec", tokens_per_sec);
+            info!("  Reason: {}", reason);
+            info!("=====================================");
+            if tier == "failed" {
+                error!("Node {} failed quality check - connection will be closed", node_label);
+            }
+        }
+        ServerMessage::TTS_REQUEST { request_id, payload } => {
+            let count = TOTAL_REQUESTS.fetch_add(1, Ordering::SeqCst) + 1;
+            let tts_uri = config.nodes.iter().find_map(|n| n.tts_uri.clone());
+            info!("[#{}] TTS request: {} (model {}, voice {}, {} chars) [queued]",
+                count, request_id, payload.model, payload.voice, payload.input.len());
+            let sem = semaphore.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
+                let response = match tts_uri {
+                    None => {
+                        error!("[#{}] TTS request but no node has a ttsUri configured", count);
+                        ClientMessage {
+                            msg_type: "TTS_ERROR".to_string(),
+                            request_id: Some(request_id),
+                            result: None,
+                            error: Some("no TTS backend configured on this operator".to_string()),
+                            models: None,
+                        }
+                    }
+                    Some(uri) => match tts_speech(&uri, &payload).await {
+                        Ok((bytes, content_type)) => {
+                            info!("[#{}] TTS completed ({} bytes)", count, bytes.len());
+                            ClientMessage {
+                                msg_type: "TTS_RESPONSE".to_string(),
+                                request_id: Some(request_id),
+                                result: Some(serde_json::json!({
+                                    "model": payload.model,
+                                    "voice": payload.voice,
+                                    "format": payload.response_format,
+                                    "content_type": content_type,
+                                    "bytes": bytes.len(),
+                                    "audio_b64": base64_encode(&bytes),
+                                })),
+                                error: None,
+                                models: None,
+                            }
+                        }
+                        Err(e) => {
+                            error!("[#{}] TTS failed: {}", count, e);
+                            ClientMessage {
+                                msg_type: "TTS_ERROR".to_string(),
+                                request_id: Some(request_id),
+                                result: None,
+                                error: Some(e),
+                                models: None,
+                            }
+                        }
+                    },
+                };
+                if let Ok(json) = serde_json::to_string(&response) {
+                    let _ = tx.send(json);
+                    info!("[#{}] TTS response queued for send", count);
+                }
+            });
+        }
+        ServerMessage::INFERENCE_REQUEST { request_id, payload } => {
+            let count = TOTAL_REQUESTS.fetch_add(1, Ordering::SeqCst) + 1;
+            let first_node = config.nodes.first().unwrap();
+            let uri = first_node.inference_uri.clone();
+            let mode = first_node.api_mode.clone();
+            let model = payload.model.clone();
+            let messages = payload.messages;
+            let stream = payload.stream;
+            let opts = GenOpts {
+                temperature: payload.temperature,
+                max_tokens: payload.max_tokens,
+            };
+            info!("[#{}] Inference request: {} ({}) via {}{} [queued]",
+                count, request_id, model, mode,
+                if stream { " streaming" } else { "" });
+            let sem = semaphore.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let _permit = sem.acquire().await.expect("semaphore closed");
+                info!("[#{}] Starting inference for {}", count, request_id);
+                let result = if stream {
+                    chat_completion_stream(&uri, &model, messages, &mode, opts, &request_id, &tx).await
+                } else {
+                    chat_completion(&uri, &model, messages, &mode, opts).await
+                };
+                let response = match result {
+                    Ok(openai_resp) => {
+                        let usage = openai_resp.usage.as_ref();
+                        let prompt_tokens = usage.map(|u| u.prompt_tokens).unwrap_or(0);
+                        let completion_tokens = usage.map(|u| u.completion_tokens).unwrap_or(0);
+                        info!("[#{}] Completed successfully ({}+{} tokens)", count, prompt_tokens, completion_tokens);
+                        ClientMessage {
+                            msg_type: "INFERENCE_RESPONSE".to_string(),
+                            request_id: Some(request_id),
+                            result: Some(serde_json::to_value(openai_resp).unwrap()),
+                            error: None,
+                            models: None,
+                        }
+                    }
+                    Err(e) => {
+                        error!("[#{}] Failed: {}", count, e);
+                        ClientMessage {
+                            msg_type: "INFERENCE_ERROR".to_string(),
+                            request_id: Some(request_id),
+                            result: None,
+                            error: Some(e),
+                            models: None,
+                        }
+                    }
+                };
+                if let Ok(json) = serde_json::to_string(&response) {
+                    let _ = tx.send(json);
+                    info!("[#{}] Response queued for send", count);
+                }
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Persistent SSE downlink + independent HTTP uplinks.
+///
+/// This is the live operator path. Heartbeats and results never share a
+/// socket with inference chunks, so a long muse-local stream cannot trip
+/// a protocol ping deadline.
+async fn run_sse_connection(config: &Config, max_threads: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    info!("Connecting to PIN server over SSE: {}", config.server_url);
+    info!("Inference threads: {}", max_threads);
+
+    let mut session = sse::Session::connect(config)
+        .await
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    info!("SSE downlink open (token {}…)", session.token_preview());
+
+    let semaphore = Arc::new(Semaphore::new(max_threads));
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await;
+    let mut heartbeat_ticks: u64 = 0;
+    let mut advertised_models: Vec<String> = Vec::new();
+
+    let mut node_endpoints: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
+    for node in &config.nodes {
+        node_endpoints.insert(node.alias.clone(), (node.inference_uri.clone(), node.api_mode.clone()));
+    }
+
+    for node_config in &config.nodes {
+        info!("Registering node over SSE: {} (region: {}, capacity: {}, endpoint: {}, mode: {})",
+            node_config.alias, node_config.region, node_config.capacity,
+            node_config.inference_uri, node_config.api_mode);
+        let mut models = match get_models(&node_config.inference_uri, &node_config.api_mode).await {
+            Ok(m) => m,
+            Err(e) => {
+                error!("Failed to get models for {} ({}): {}", node_config.alias, node_config.api_mode, e);
+                vec![]
+            }
+        };
+        if node_config.tts_uri.is_some() {
+            for m in node_config.tts_models.clone().unwrap_or_default() {
+                let tagged = format!("tts:{}", m);
+                if !models.contains(&tagged) {
+                    info!("Node {} advertising TTS model: {}", node_config.alias, tagged);
+                    models.push(tagged);
+                }
+            }
+        }
+        if models.is_empty() {
+            warn!("No models found for node {} - check endpoint {}", node_config.alias, node_config.inference_uri);
+        } else {
+            info!("Node {} has {} models: {:?}", node_config.alias, models.len(), models);
+        }
+        for model in &models {
+            if !advertised_models.contains(model) {
+                advertised_models.push(model.clone());
+            }
+        }
+        if let Err(e) = session.register_node(
+            &node_config.alias,
+            &models,
+            node_config.capacity,
+            &node_config.region,
+            node_config.price_per_thousand_tokens,
+            node_config.interview_model.as_deref(),
+            &node_config.api_mode,
+        ).await {
+            error!("Failed to register node {} over SSE: {}", node_config.alias, e);
+        }
+    }
+    info!("Registered {} node(s) with PIN network over SSE", config.nodes.len());
+    if let Err(e) = session.heartbeat(Some(advertised_models.as_slice())).await {
+        warn!("Initial SSE heartbeat failed: {}", e);
+    } else {
+        info!("Broadcast {} model(s) after SSE connect", advertised_models.len());
+    }
+
+    while RUNNING.load(Ordering::SeqCst) {
+        tokio::select! {
+            response_json = rx.recv() => {
+                let Some(json) = response_json else { continue; };
+                if let Err(e) = session.send_uplink_json(&json).await {
+                    error!("SSE uplink failed: {}", e);
+                }
+            }
+            event = session.recv() => {
+                match event {
+                    Some(event) => {
+                        handle_sse_event(config, event, &node_endpoints, &semaphore, &tx).await?;
+                    }
+                    None => {
+                        info!("SSE downlink ended");
+                        break;
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                if let Err(e) = session.heartbeat(None).await {
+                    warn!("SSE heartbeat failed: {}", e);
+                    break;
+                }
+                heartbeat_ticks += 1;
+                if heartbeat_ticks.is_multiple_of(4) && !advertised_models.is_empty() {
+                    if let Err(e) = session.heartbeat(Some(advertised_models.as_slice())).await {
+                        warn!("SSE model rebroadcast failed: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if sse::prefers_sse(config) {
+        match run_sse_connection(config, max_threads).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                warn!("SSE transport failed ({e}); falling back to WebSocket");
+            }
+        }
+    }
     info!("Connecting to PIN server: {}", config.server_url);
     info!("Inference threads: {}", max_threads);
 
@@ -2135,6 +2468,7 @@ mod stream_tests {
             payout_address: None,
             server_url: format!("ws://{}", addr),
             reconnect_delay_secs: 5,
+            transport: "ws".into(),
         };
         run_connection(&config, 1).await.unwrap();
         server.await.unwrap();
@@ -2167,5 +2501,30 @@ mod stream_tests {
             role: "user".into(), content: "hi".into(), thinking: None,
         }).unwrap();
         assert!(m.get("thinking").is_none(), "must be skipped when None: {}", m);
+    }
+
+    #[test]
+    fn sse_is_the_default_and_ws_is_an_explicit_fallback() {
+        let sse = Config {
+            client_id: "x".into(),
+            api_secret: "y".into(),
+            nodes: vec![],
+            payout_address: None,
+            server_url: "wss://aiassist.net/api/v1/pin/ws".into(),
+            reconnect_delay_secs: 5,
+            transport: default_transport(),
+        };
+        assert!(sse::prefers_sse(&sse));
+        let mut ws = sse.clone();
+        ws.transport = "ws".into();
+        assert!(!sse::prefers_sse(&ws));
+    }
+
+    #[test]
+    fn sse_event_payload_prefers_data_over_event_type() {
+        let ev = sse::SseEvent { event_type: "INFERENCE_REQUEST".into(), data: r#"{"type":"PING"}"#.into() };
+        assert_eq!(ev.payload(), r#"{"type":"PING"}"#);
+        let keep = sse::SseEvent { event_type: String::new(), data: String::new() };
+        assert_eq!(keep.payload(), "");
     }
 }

@@ -2,6 +2,7 @@
   "clientId": "op_your_operator_id",
   "apiSecret": "your_api_secret_from_registration",
   "payoutAddress": "0x_your_bsc_wallet_address",
+  "transport": "sse",
   "nodes": [
     {
       "alias": "GPU-1",
