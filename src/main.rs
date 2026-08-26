@@ -1043,6 +1043,26 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
 
     let (ws_stream, _) = connect_async(&config.server_url).await?;
     let (mut write, mut read) = ws_stream.split();
+
+    // One task owns the socket sink. Control traffic has strict priority over
+    // inference chunks, so Pong/heartbeat/health can never sit behind a busy
+    // model stream waiting for the writer.
+    let (control_tx, mut control_rx) = mpsc::unbounded_channel::<Message>();
+    let (data_tx, mut data_rx) = mpsc::unbounded_channel::<Message>();
+    let writer_task = tokio::spawn(async move {
+        loop {
+            let message = tokio::select! {
+                biased;
+                message = control_rx.recv() => message,
+                message = data_rx.recv() => message,
+            };
+            let Some(message) = message else { break; };
+            if let Err(e) = write.send(message).await {
+                error!("WebSocket writer failed: {}", e);
+                break;
+            }
+        }
+    });
     
     let semaphore = Arc::new(Semaphore::new(max_threads));
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -1070,9 +1090,9 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
         signature,
     };
 
-    write
+    control_tx
         .send(Message::Text(serde_json::to_string(&auth_msg)?))
-        .await?;
+        .map_err(|_| "WebSocket writer closed before AUTH")?;
     info!("Sent AUTH message for {}", config.client_id);
 
     let mut node_endpoints: std::collections::HashMap<String, (String, String)> = std::collections::HashMap::new();
@@ -1084,8 +1104,8 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
         tokio::select! {
             response_json = rx.recv() => {
                 if let Some(json) = response_json {
-                    if let Err(e) = write.send(Message::Text(json)).await {
-                        error!("Failed to send response: {}", e);
+                    if data_tx.send(Message::Text(json)).is_err() {
+                        error!("Failed to queue response: WebSocket writer closed");
                     }
                 }
             }
@@ -1107,8 +1127,8 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                                     msg_type: "UPDATE_WALLET".to_string(),
                                                     payout_address: payout_addr.clone(),
                                                 };
-                                                if let Err(e) = write.send(Message::Text(serde_json::to_string(&wallet_msg)?)).await {
-                                                    error!("Failed to update wallet: {}", e);
+                                                if control_tx.send(Message::Text(serde_json::to_string(&wallet_msg)?)).is_err() {
+                                                    error!("Failed to queue wallet update: writer closed");
                                                 }
                                             }
                                         }
@@ -1165,8 +1185,8 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                                 interview_model: node_config.interview_model.clone(),
                                             };
                                             
-                                            if let Err(e) = write.send(Message::Text(serde_json::to_string(&register_msg)?)).await {
-                                                error!("Failed to register node {}: {}", node_config.alias, e);
+                                            if control_tx.send(Message::Text(serde_json::to_string(&register_msg)?)).is_err() {
+                                                error!("Failed to queue node registration for {}: writer closed", node_config.alias);
                                             }
                                         }
                                         
@@ -1179,8 +1199,8 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                                 error: None,
                                                 models: Some(advertised_models.clone()),
                                             };
-                                            if let Err(e) = write.send(Message::Text(serde_json::to_string(&model_list)?)).await {
-                                                error!("Failed to broadcast model list: {}", e);
+                                            if control_tx.send(Message::Text(serde_json::to_string(&model_list)?)).is_err() {
+                                                error!("Failed to queue model list broadcast: writer closed");
                                             } else {
                                                 info!("Broadcast {} model(s) after authentication", advertised_models.len());
                                             }
@@ -1203,7 +1223,7 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                             error: None,
                                             models: None,
                                         };
-                                        let _ = write.send(Message::Text(serde_json::to_string(&pong)?)).await;
+                                        let _ = control_tx.send(Message::Text(serde_json::to_string(&pong)?));
                                     }
                                     ServerMessage::HEARTBEAT_ACK | ServerMessage::MODEL_LIST_ACK => {}
                                     ServerMessage::UPDATE_WALLET_ACK { success, message } => {
@@ -1441,8 +1461,8 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                     // different application message. Ignoring this control frame
                     // makes Uvicorn close an otherwise active inference socket.
                     Some(Ok(Message::Ping(payload))) => {
-                        if let Err(e) = write.send(Message::Pong(payload)).await {
-                            error!("Failed to answer WebSocket ping: {}", e);
+                        if control_tx.send(Message::Pong(payload)).is_err() {
+                            error!("Failed to queue WebSocket Pong: writer closed");
                             break;
                         }
                     }
@@ -1474,8 +1494,8 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                     error: None,
                     models: None,
                 };
-                if write.send(Message::Text(serde_json::to_string(&heartbeat)?)).await.is_err() {
-                    warn!("Failed to send heartbeat");
+                if control_tx.send(Message::Text(serde_json::to_string(&heartbeat)?)).is_err() {
+                    warn!("Failed to queue heartbeat: writer closed");
                     break;
                 }
                 heartbeat_ticks += 1;
@@ -1490,8 +1510,8 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                         error: None,
                         models: Some(advertised_models.clone()),
                     };
-                    if write.send(Message::Text(serde_json::to_string(&model_list)?)).await.is_err() {
-                        warn!("Failed to rebroadcast model list");
+                    if control_tx.send(Message::Text(serde_json::to_string(&model_list)?)).is_err() {
+                        warn!("Failed to queue model list rebroadcast: writer closed");
                         break;
                     }
                 }
@@ -1499,6 +1519,9 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
         }
     }
 
+    drop(control_tx);
+    drop(data_tx);
+    let _ = writer_task.await;
     Ok(())
 }
 
@@ -2072,6 +2095,47 @@ mod stream_tests {
             .await
             .expect_err("empty audio must be an error");
         assert!(err.contains("empty"), "got: {}", err);
+    }
+
+    #[tokio::test]
+    async fn protocol_ping_receives_pong_without_waiting_for_application_heartbeat() {
+        RUNNING.store(true, Ordering::SeqCst);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let auth = ws.next().await.unwrap().unwrap();
+            assert!(matches!(auth, Message::Text(_)));
+            ws.send(Message::Text(
+                r#"{"type":"AUTH_SUCCESS","operator_id":"op_test","node_id":null,"message":"ok"}"#.into(),
+            )).await.unwrap();
+
+            let payload = vec![7u8, 8, 9];
+            ws.send(Message::Ping(payload.clone())).await.unwrap();
+            let pong = tokio::time::timeout(Duration::from_secs(3), async {
+                loop {
+                    match ws.next().await {
+                        Some(Ok(Message::Pong(received))) => break received,
+                        Some(Ok(_)) => continue,
+                        other => panic!("socket ended before pong: {:?}", other),
+                    }
+                }
+            }).await.expect("pong deadline");
+            assert_eq!(pong, payload);
+            ws.close(None).await.unwrap();
+        });
+
+        let config = Config {
+            client_id: "pin_test".into(),
+            api_secret: "secret".into(),
+            nodes: vec![],
+            payout_address: None,
+            server_url: format!("ws://{}", addr),
+            reconnect_delay_secs: 5,
+        };
+        run_connection(&config, 1).await.unwrap();
+        server.await.unwrap();
     }
 
     #[test]
