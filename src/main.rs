@@ -10,6 +10,8 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, error, info, warn};
 
+pub mod sse;
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 /// Server-requested reconnect delay, in seconds. Set when the server tells us
 /// to wait (INTERVIEW_FAILED carries retry_after_seconds); consumed once by
@@ -61,7 +63,7 @@ fn default_price() -> f64 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct Config {
+pub struct Config {
     client_id: String,
     api_secret: String,
     nodes: Vec<NodeConfig>,
@@ -415,7 +417,7 @@ struct OllamaModel {
     name: String,
 }
 
-fn compute_signature(client_id: &str, timestamp: &str, api_secret: &str) -> String {
+pub fn compute_signature(client_id: &str, timestamp: &str, api_secret: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(api_secret.as_bytes());
     let secret_hash = hex::encode(hasher.finalize());
