@@ -92,7 +92,7 @@ fn next_reconnect_delay(configured: u64) -> u64 {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-#[allow(non_camel_case_types)]
+#[allow(non_camel_case_types, clippy::upper_case_acronyms)]
 enum ServerMessage {
     AUTH_SUCCESS { operator_id: String, node_id: Option<String>, message: String },
     ERROR { message: String },
@@ -1046,6 +1046,14 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
     
     let semaphore = Arc::new(Semaphore::new(max_threads));
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    // A real interval, not `sleep()` inside select. Incoming stream traffic made
+    // the read branch win continuously and cancelled/recreated the sleep future,
+    // so a busy power user could starve heartbeats forever.
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    heartbeat.tick().await; // consume interval's immediate first tick
+    let mut heartbeat_ticks: u64 = 0;
+    let mut advertised_models: Vec<String> = Vec::new();
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1105,7 +1113,10 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                             }
                                         }
 
-                                        // Register each configured node with the server
+                                        // Register each configured node with the server.
+                                        // Rebuild the advertised model set on every AUTH so a
+                                        // reconnect is a complete state broadcast, not a delta.
+                                        advertised_models.clear();
                                         // Each node may have its own endpoint and API mode
                                         for node_config in &config.nodes {
                                             info!("Registering node: {} (region: {}, capacity: {}, endpoint: {}, mode: {})", 
@@ -1138,6 +1149,12 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                                 info!("Node {} has {} models: {:?}", node_config.alias, models.len(), models);
                                             }
                                             
+                                            for model in &models {
+                                                if !advertised_models.contains(model) {
+                                                    advertised_models.push(model.clone());
+                                                }
+                                            }
+
                                             let register_msg = RegisterNodeMessage {
                                                 msg_type: "REGISTER_NODE".to_string(),
                                                 alias: node_config.alias.clone(),
@@ -1154,6 +1171,20 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                         }
                                         
                                         info!("Registered {} node(s) with PIN network", config.nodes.len());
+                                        if !advertised_models.is_empty() {
+                                            let model_list = ClientMessage {
+                                                msg_type: "MODEL_LIST".to_string(),
+                                                request_id: None,
+                                                result: None,
+                                                error: None,
+                                                models: Some(advertised_models.clone()),
+                                            };
+                                            if let Err(e) = write.send(Message::Text(serde_json::to_string(&model_list)?)).await {
+                                                error!("Failed to broadcast model list: {}", e);
+                                            } else {
+                                                info!("Broadcast {} model(s) after authentication", advertised_models.len());
+                                            }
+                                        }
                                     }
                                     ServerMessage::REGISTER_NODE_ACK { node_id, alias, models, created, message } => {
                                         let status = if created { "registered" } else { "updated" };
@@ -1183,25 +1214,40 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                         }
                                     }
                                     ServerMessage::INTERVIEW_REQUEST { interview_id, node_id, model, prompts, timeout_ms: _ } => {
-                                        let node_label = node_id.as_deref().unwrap_or("operator");
+                                        let node_label = node_id.as_deref().unwrap_or("operator").to_string();
                                         info!("[INTERVIEW] Received interview for {} - model {} ({} prompts)", 
                                             node_label, model, prompts.len());
                                         
-                                        let (uri, mode) = match node_endpoints.get(node_label) {
+                                        let (uri, mode) = match node_endpoints.get(&node_label) {
                                             Some((u, m)) => (u.clone(), m.clone()),
                                             None => {
                                                 let first = config.nodes.first().unwrap();
                                                 (first.inference_uri.clone(), first.api_mode.clone())
                                             }
                                         };
-                                        
-                                        let interview_result = execute_interview(&uri, &interview_id, &model, prompts, &mode).await;
-                                        
-                                        if let Err(e) = write.send(Message::Text(serde_json::to_string(&interview_result)?)).await {
-                                            error!("[INTERVIEW] Failed to send result: {}", e);
-                                        } else {
-                                            info!("[INTERVIEW] Result sent to server for {}", node_label);
-                                        }
+
+                                        // Interviews take 20-60 seconds. Awaiting them inside the
+                                        // WebSocket reader blocks protocol Ping/Pong and the
+                                        // application heartbeat for the whole exam; Uvicorn closes
+                                        // the socket, then the daemon prints VERIFIED for a
+                                        // connection that is already dead. Run inference off-loop
+                                        // and return the result through the one writer channel.
+                                        let tx = tx.clone();
+                                        tokio::spawn(async move {
+                                            let interview_result = execute_interview(
+                                                &uri, &interview_id, &model, prompts, &mode,
+                                            ).await;
+                                            match serde_json::to_string(&interview_result) {
+                                                Ok(json) => {
+                                                    if tx.send(json).is_err() {
+                                                        error!("[INTERVIEW] Failed to queue result for {}: writer closed", node_label);
+                                                    } else {
+                                                        info!("[INTERVIEW] Result queued for server for {}", node_label);
+                                                    }
+                                                }
+                                                Err(e) => error!("[INTERVIEW] Failed to encode result for {}: {}", node_label, e),
+                                            }
+                                        });
                                     }
                                     ServerMessage::INTERVIEW_FAILED {
                                         node_id,
@@ -1390,8 +1436,23 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                             }
                         }
                     }
-                    Some(Ok(Message::Close(_))) => {
-                        info!("Server closed connection");
+                    // Uvicorn sends protocol-level WebSocket Ping frames on its
+                    // own keepalive schedule. JSON {"type":"PING"} below is a
+                    // different application message. Ignoring this control frame
+                    // makes Uvicorn close an otherwise active inference socket.
+                    Some(Ok(Message::Ping(payload))) => {
+                        if let Err(e) = write.send(Message::Pong(payload)).await {
+                            error!("Failed to answer WebSocket ping: {}", e);
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Pong(_))) => {}
+                    Some(Ok(Message::Close(frame))) => {
+                        if let Some(frame) = frame {
+                            info!("Server closed connection: code={} reason={}", frame.code, frame.reason);
+                        } else {
+                            info!("Server closed connection without a close frame");
+                        }
                         break;
                     }
                     Some(Err(e)) => {
@@ -1405,7 +1466,7 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                     _ => {}
                 }
             }
-            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+            _ = heartbeat.tick() => {
                 let heartbeat = ClientMessage {
                     msg_type: "HEARTBEAT".to_string(),
                     request_id: None,
@@ -1416,6 +1477,23 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                 if write.send(Message::Text(serde_json::to_string(&heartbeat)?)).await.is_err() {
                     warn!("Failed to send heartbeat");
                     break;
+                }
+                heartbeat_ticks += 1;
+                // Every fourth 15s heartbeat, reassert model membership. The
+                // server's MODEL_LIST path repairs model indexes without
+                // triggering a quality interview.
+                if heartbeat_ticks.is_multiple_of(4) && !advertised_models.is_empty() {
+                    let model_list = ClientMessage {
+                        msg_type: "MODEL_LIST".to_string(),
+                        request_id: None,
+                        result: None,
+                        error: None,
+                        models: Some(advertised_models.clone()),
+                    };
+                    if write.send(Message::Text(serde_json::to_string(&model_list)?)).await.is_err() {
+                        warn!("Failed to rebroadcast model list");
+                        break;
+                    }
                 }
             }
         }
