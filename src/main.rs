@@ -350,6 +350,45 @@ struct OpenAIStreamChoice {
 struct OpenAIStreamDelta {
     #[serde(default)]
     content: Option<String>,
+    /// A reasoning model's thinking, on the OpenAI-compatible path.
+    ///
+    /// This struct used to carry `content` alone, which meant every reasoning
+    /// token was silently discarded here — the Ollama path handled `thinking`
+    /// (see the "Thinking FIRST" comment below) and this one had no field for
+    /// the same data under a different name.
+    ///
+    /// Measured against hearth on Thunder, streaming NuExtract3:
+    ///
+    ///   data: {"choices":[{"delta":{"reasoning_content":"The"}}]}
+    ///   data: {"choices":[{"delta":{"reasoning_content":" user"}}]}
+    ///
+    /// So on this path the whole reasoning phase produced NO uplink chunks at
+    /// all. That is not merely lost detail: AiAS relays `kind: "thinking"`
+    /// chunks as `delta.reasoning` for the consumer's live trace, and an
+    /// operator that sends nothing for minutes is indistinguishable upstream
+    /// from one that has died. Silence is the failure mode the thinking channel
+    /// exists to prevent.
+    ///
+    /// Three spellings because three servers disagree: `reasoning_content`
+    /// (llama.cpp/hearth), `reasoning` (Ollama's OpenAI shim), `thinking`
+    /// (some Anthropic-compatible proxies). Accepting all three costs nothing
+    /// and each one we omit is another silent phase.
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    reasoning: Option<String>,
+    #[serde(default)]
+    thinking: Option<String>,
+}
+
+impl OpenAIStreamDelta {
+    /// Whichever field this server uses for reasoning, if any.
+    fn reasoning_text(&mut self) -> Option<String> {
+        self.reasoning_content
+            .take()
+            .or_else(|| self.reasoning.take())
+            .or_else(|| self.thinking.take())
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -833,6 +872,10 @@ async fn chat_completion_stream_openai(
     let mut usage: Option<OpenAIUsage> = None;
     let mut finish_reason: Option<String> = None;
     let mut index = 0u32;
+    // Counted, not accumulated: the Ollama path warns when a model spends its
+    // whole budget reasoning and answers nothing, and that warning was
+    // impossible here while reasoning was invisible.
+    let mut reasoning_chars = 0usize;
 
     while let Some(item) = stream.next().await {
         let bytes = item.map_err(|e| format!("OpenAI stream error: {}", e))?;
@@ -861,10 +904,26 @@ async fn chat_completion_stream_openai(
             if chunk.usage.is_some() {
                 usage = chunk.usage;
             }
-            if let Some(choice) = chunk.choices.into_iter().next() {
+            if let Some(mut choice) = chunk.choices.into_iter().next() {
                 if choice.finish_reason.is_some() {
                     finish_reason = choice.finish_reason;
                 }
+
+                // THINKING FIRST, exactly as the Ollama path does it. A
+                // reasoning model emits only reasoning for the whole first
+                // phase with content empty, so a reader that waits for content
+                // reports silence while the model is working hardest.
+                //
+                // Not appended to `content`: it is liveness for the consumer,
+                // never part of the answer.
+                if let Some(reasoning) = choice.delta.reasoning_text() {
+                    if !reasoning.is_empty() {
+                        reasoning_chars += reasoning.chars().count();
+                        send_chunk(tx, ChunkMessage::thinking(request_id, index, reasoning))?;
+                        index += 1;
+                    }
+                }
+
                 if let Some(delta) = choice.delta.content {
                     if !delta.is_empty() {
                         content.push_str(&delta);
@@ -874,6 +933,18 @@ async fn chat_completion_stream_openai(
                 }
             }
         }
+    }
+
+    // Parity with the Ollama path: a model that reasoned and never answered is
+    // a real outcome worth naming, not an empty success. AiAS already handles
+    // this case ("produced reasoning but no answer") and could not see it from
+    // this path before.
+    if content.trim().is_empty() && reasoning_chars > 0 {
+        warn!(
+            "model produced {} chars of reasoning and NO answer -- \
+             likely hit max_tokens while thinking",
+            reasoning_chars
+        );
     }
 
     Ok(OpenAIResponse {
