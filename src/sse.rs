@@ -370,8 +370,48 @@ impl Uplink {
             | "INFERENCE_ERROR"
             | "TTS_RESPONSE"
             | "TTS_ERROR"
-            | "INTERVIEW_RESULT" => self.inference_result(request_id, parsed).await,
+            | "INTERVIEW_RESULT" => {
+                self.inference_result(request_id, &uplink_payload(parsed))
+                    .await
+            }
             other => Err(format!("unhandled SSE uplink type {other}")),
+        }
+    }
+}
+
+/// The payload to put in a result uplink's `result` field.
+///
+/// SEND THE PAYLOAD, NOT THE ENVELOPE.
+///
+/// This passed the whole parsed message -- `type` and `request_id` included --
+/// as the `result` field, so the server received a completion wrapped twice.
+/// It unwraps exactly one layer (correct for the WebSocket path, where the
+/// frame IS the envelope), read `choices` off the envelope that remained, got
+/// `[]`, and the caller got:
+///
+///     Inference result received: ['request_id','result','type']
+///     Provider API error: list index out of range
+///     POST /v1/chat/completions 500
+///
+/// Pure and separate from the request because this was a one-word mistake
+/// that a test catches instantly.
+///
+///   * nested under `result` (inference, interview) -> the inner value
+///   * carried inline (TTS shapes) -> the object minus `type`/`request_id`,
+///     which the server takes from the request anyway
+///
+/// Stripping the inline shapes to nothing would trade a 500 for a silent
+/// empty answer, which is worse.
+pub fn uplink_payload(parsed: &serde_json::Value) -> serde_json::Value {
+    match parsed.get("result") {
+        Some(inner) => inner.clone(),
+        None => {
+            let mut stripped = parsed.clone();
+            if let Some(obj) = stripped.as_object_mut() {
+                obj.remove("type");
+                obj.remove("request_id");
+            }
+            stripped
         }
     }
 }
