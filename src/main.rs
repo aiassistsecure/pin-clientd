@@ -109,6 +109,14 @@ enum ServerMessage {
     PING,
     HEARTBEAT_ACK,
     MODEL_LIST_ACK,
+    /// Acknowledgement that the gateway accepted a result we posted on the
+    /// uplink. There is nothing to do with it — but without the variant serde
+    /// rejected the frame, so every completed request logged a WARN that read
+    /// like a protocol fault while the request had in fact succeeded.
+    RESULT_ACK {
+        #[serde(default)]
+        request_id: Option<String>,
+    },
     REGISTER_NODE_ACK { node_id: String, alias: String, models: Vec<String>, created: bool, message: String },
     UPDATE_WALLET_ACK { success: bool, message: String },
     INFERENCE_REQUEST { request_id: String, payload: InferencePayload },
@@ -1077,7 +1085,10 @@ async fn handle_sse_event(
             error!("Server error: {}", message);
             return Err(message.into());
         }
-        ServerMessage::HEARTBEAT_ACK | ServerMessage::MODEL_LIST_ACK | ServerMessage::PING => {}
+        ServerMessage::HEARTBEAT_ACK
+        | ServerMessage::MODEL_LIST_ACK
+        | ServerMessage::PING
+        | ServerMessage::RESULT_ACK { .. } => {}
         ServerMessage::UPDATE_WALLET_ACK { success, message } => {
             if success { info!("[WALLET] {}", message); } else { warn!("[WALLET] Failed: {}", message); }
         }
@@ -1327,14 +1338,59 @@ async fn run_sse_connection(config: &Config, max_threads: usize) -> Result<(), B
         info!("Broadcast {} model(s) after SSE connect", advertised_models.len());
     }
 
-    while RUNNING.load(Ordering::SeqCst) {
-        tokio::select! {
-            response_json = rx.recv() => {
-                let Some(json) = response_json else { continue; };
-                if let Err(e) = session.send_uplink_json(&json).await {
+    // THE UPLINK GETS ITS OWN TASK.
+    //
+    // This drain used to be a branch of the `select!` below, which meant every
+    // streamed token's POST was awaited by the same loop that owns the 15 s
+    // heartbeat and job intake. A 1417-token generation is 1417 sequential
+    // POSTs (~70 s at a measured 49 ms warm), and for that whole window no
+    // heartbeat could leave. AiAS evicts an operator whose heartbeat is older
+    // than 60 s (api/workers/pin_heartbeat.py STALE_THRESHOLD_SECONDS), so the
+    // daemon removed ITSELF from the online set while happily serving — and
+    // the gateway answered "No operators available" for a model this node had
+    // loaded. Observed as result-ack lag growing without bound: 159 s, then
+    // 5m22s, then 9m21s on one run.
+    //
+    // Order is preserved: a single task draining one channel sequentially
+    // keeps each request's chunks, and its terminal result, in the order the
+    // worker produced them.
+    let uplink = session.uplink();
+    let uplink_task = tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            // Take everything already queued so a burst of deltas becomes a
+            // few POSTs instead of one per token.
+            let mut batch = match serde_json::from_str::<serde_json::Value>(&first) {
+                Ok(v) => vec![v],
+                Err(e) => {
+                    error!("SSE uplink: undecodable message dropped: {}", e);
+                    continue;
+                }
+            };
+            while let Ok(next) = rx.try_recv() {
+                match serde_json::from_str::<serde_json::Value>(&next) {
+                    Ok(v) => batch.push(v),
+                    Err(e) => error!("SSE uplink: undecodable message dropped: {}", e),
+                }
+            }
+            let queued = batch.len();
+            let messages = sse::coalesce_uplink_batch(batch);
+            if queued > messages.len() {
+                debug!(
+                    "SSE uplink coalesced {} queued message(s) into {} POST(s)",
+                    queued,
+                    messages.len()
+                );
+            }
+            for msg in messages {
+                if let Err(e) = uplink.send_uplink_json_value(&msg).await {
                     error!("SSE uplink failed: {}", e);
                 }
             }
+        }
+    });
+
+    while RUNNING.load(Ordering::SeqCst) {
+        tokio::select! {
             event = session.recv() => {
                 match event {
                     Some(event) => {
@@ -1361,6 +1417,10 @@ async fn run_sse_connection(config: &Config, max_threads: usize) -> Result<(), B
             }
         }
     }
+    // The workers' `tx` clones die with the loop, so the drain ends on its own
+    // once the queue empties. Abort only guards against a task wedged in a
+    // POST while we are already tearing the session down to reconnect.
+    uplink_task.abort();
     Ok(())
 }
 
@@ -1560,7 +1620,9 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                         };
                                         let _ = control_tx.send(Message::Text(serde_json::to_string(&pong)?));
                                     }
-                                    ServerMessage::HEARTBEAT_ACK | ServerMessage::MODEL_LIST_ACK => {}
+                                    ServerMessage::HEARTBEAT_ACK
+                                    | ServerMessage::MODEL_LIST_ACK
+                                    | ServerMessage::RESULT_ACK { .. } => {}
                                     ServerMessage::UPDATE_WALLET_ACK { success, message } => {
                                         if success {
                                             info!("[WALLET] {}", message);
@@ -2518,6 +2580,26 @@ mod stream_tests {
         let mut ws = sse.clone();
         ws.transport = "ws".into();
         assert!(!sse::prefers_sse(&ws));
+    }
+
+    #[test]
+    fn result_ack_parses_instead_of_logging_a_protocol_warning() {
+        // The gateway sends this after accepting a posted result. Before the
+        // variant existed serde rejected it, so a SUCCESSFUL request produced
+        // "Failed to parse SSE event RESULT_ACK: unknown variant" -- a warning
+        // that read like a fault when nothing was wrong.
+        let frame = r#"{"type": "RESULT_ACK", "request_id": "pin_req_hZaE5_PiUGRsyZ8kwsc1bg"}"#;
+        match serde_json::from_str::<ServerMessage>(frame) {
+            Ok(ServerMessage::RESULT_ACK { request_id }) => {
+                assert_eq!(request_id.as_deref(), Some("pin_req_hZaE5_PiUGRsyZ8kwsc1bg"));
+            }
+            other => panic!("expected RESULT_ACK, got {other:?}"),
+        }
+        // And without the optional field, since it is `#[serde(default)]`.
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(r#"{"type":"RESULT_ACK"}"#),
+            Ok(ServerMessage::RESULT_ACK { request_id: None })
+        ));
     }
 
     #[test]
