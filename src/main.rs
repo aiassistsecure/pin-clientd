@@ -2695,6 +2695,46 @@ mod stream_tests {
     }
 
     #[test]
+    fn a_result_uplink_sends_the_completion_not_the_envelope() {
+        // The 500 this fixes:
+        //   Inference result received: ['request_id','result','type']
+        //   Provider API error: list index out of range
+        // The server unwraps ONE layer; sending the whole envelope as the
+        // payload left it holding an envelope and reading choices off it.
+        let envelope = serde_json::json!({
+            "type": "INFERENCE_RESPONSE",
+            "request_id": "pin_req_JcWCDaRD5IGe-YQMt0X-zw",
+            "result": {
+                "id": "chatcmpl-abc",
+                "choices": [{"index": 0,
+                             "message": {"role": "assistant", "content": "OK"},
+                             "finish_reason": "stop"}]
+            }
+        });
+        let payload = sse::uplink_payload(&envelope);
+        assert!(payload.get("type").is_none(), "no envelope may survive");
+        assert_eq!(payload["choices"][0]["message"]["content"], "OK");
+    }
+
+    #[test]
+    fn a_payload_carried_inline_keeps_its_fields_and_loses_only_routing() {
+        // TTS and interview shapes do not nest under `result`. Stripping them
+        // to nothing would trade a 500 for a silent empty answer.
+        let inline = serde_json::json!({
+            "type": "TTS_RESPONSE",
+            "request_id": "pin_req_x",
+            "audio_base64": "AAAA",
+            "sample_rate": 24000
+        });
+        let payload = sse::uplink_payload(&inline);
+        assert_eq!(payload["audio_base64"], "AAAA");
+        assert_eq!(payload["sample_rate"], 24000);
+        assert!(payload.get("type").is_none());
+        assert!(payload.get("request_id").is_none(),
+                "the server takes routing from the request, not the body");
+    }
+
+    #[test]
     fn a_known_event_still_wins_over_the_catch_all() {
         // The catch-all must not swallow messages that have real handlers --
         // an INFERENCE_REQUEST silently ignored is a node that looks online

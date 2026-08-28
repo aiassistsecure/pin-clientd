@@ -302,8 +302,52 @@ impl Session {
             | "INFERENCE_ERROR"
             | "TTS_RESPONSE"
             | "TTS_ERROR"
-            | "INTERVIEW_RESULT" => self.inference_result(request_id, &parsed).await,
+            | "INTERVIEW_RESULT" => {
+                // SEND THE PAYLOAD, NOT THE ENVELOPE.
+                //
+                // This passed `&parsed` -- the whole message, `type` and
+                // `request_id` included -- as the `result` field, so the
+                // server received a completion wrapped twice. It unwrapped
+                // once, read `choices` off the envelope that remained, got
+                // `[]`, and the caller got:
+                //
+                //     Inference result received: ['request_id','result','type']
+                //     Provider API error: list index out of range
+                //     POST /v1/chat/completions 500
+                //
+                // The WebSocket path never had this bug: the server unwraps
+                // the frame there, so exactly one envelope was ever intended.
+                //
+                // Messages carrying their payload inline rather than under
+                // `result` still send the whole object, minus the routing
+                // fields the server supplies itself.
+                self.inference_result(request_id, &uplink_payload(&parsed)).await
+            }
             other => Err(format!("unhandled SSE uplink type {other}")),
+        }
+    }
+}
+
+/// The payload to put in a result uplink's `result` field.
+///
+/// Pure, and separate from the request, because the bug it fixes was a
+/// one-word mistake that a test could have caught: the caller passed the whole
+/// parsed envelope, so the server received the completion wrapped twice, read
+/// `choices` off the outer envelope, got `[]`, and answered 500.
+///
+/// A message that nests its payload under `result` contributes that. One that
+/// carries its payload inline contributes itself, minus the routing fields the
+/// server already has from the request.
+pub fn uplink_payload(parsed: &serde_json::Value) -> serde_json::Value {
+    match parsed.get("result") {
+        Some(inner) => inner.clone(),
+        None => {
+            let mut stripped = parsed.clone();
+            if let Some(obj) = stripped.as_object_mut() {
+                obj.remove("type");
+                obj.remove("request_id");
+            }
+            stripped
         }
     }
 }
