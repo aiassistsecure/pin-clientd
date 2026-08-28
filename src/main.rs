@@ -185,6 +185,16 @@ struct InferencePayload {
     temperature: Option<f64>,
     #[serde(default)]
     max_tokens: Option<u32>,
+    /// Tool definitions, forwarded verbatim to the backend. Kept as raw JSON
+    /// on purpose: the schema belongs to the caller and the backend; the relay
+    /// typing it would only add a place for the two to disagree. Undeclared
+    /// fields are dropped by serde — the same silence that once ate
+    /// temperature, max_tokens and the entire reasoning channel — so these are
+    /// declared the day the server learns to send them.
+    #[serde(default)]
+    tools: Option<serde_json::Value>,
+    #[serde(default)]
+    tool_choice: Option<serde_json::Value>,
 }
 
 /// OpenAI-compatible speech request, forwarded to a node's TTS backend as
@@ -211,10 +221,16 @@ fn default_audio_format() -> String {
 }
 
 /// Generation knobs, threaded to whichever backend serves the request.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// No longer `Copy`: tools are JSON and JSON does not copy. Call sites that
+/// used the same opts on two branches clone explicitly, which is honest about
+/// the cost instead of hiding it in a bitwise copy.
+#[derive(Debug, Clone, Default)]
 struct GenOpts {
     temperature: Option<f64>,
     max_tokens: Option<u32>,
+    tools: Option<serde_json::Value>,
+    tool_choice: Option<serde_json::Value>,
 }
 
 impl GenOpts {
@@ -252,6 +268,12 @@ struct ChatMessage {
     /// send upstream are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     thinking: Option<String>,
+    /// A tool-calling model answers with `tool_calls` INSTEAD of content.
+    /// Undeclared, serde drops it and a perfect structured answer arrives as
+    /// an empty message — the exact bug class as the `thinking` drop above,
+    /// one field over. Raw JSON for the same reason as InferencePayload.tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -368,6 +390,14 @@ struct OpenAIStreamDelta {
     /// (which spells it `message.thinking`) to llama-server.
     #[serde(default, alias = "reasoning")]
     reasoning_content: Option<String>,
+    /// Incremental tool-call fragments, per the OpenAI streaming shape: each
+    /// carries an `index`, the first fragment for an index carries `id` and
+    /// `function.name`, and every fragment appends to `function.arguments`.
+    /// Undeclared, serde would drop them and a structured answer would arrive
+    /// as an empty message — the same silence as `thinking` and
+    /// `reasoning_content` before it, one field over.
+    #[serde(default)]
+    tool_calls: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -398,6 +428,10 @@ struct OllamaChatRequest {
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     options: Option<serde_json::Value>,
+    /// Ollama's /api/chat accepts OpenAI-shaped tool definitions natively.
+    /// Same omit-when-absent rule as everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -518,6 +552,14 @@ struct OpenAIChatRequest {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    // Omitted when absent, NEVER serialized as null: llama.cpp applies its
+    // chat template differently for a present-but-null `tools`, and a request
+    // without tools must stay byte-identical to what this daemon sent before
+    // tools existed. Same rule the gateway enforces on its side.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
 }
 
 async fn chat_completion_ollama(
@@ -534,6 +576,7 @@ async fn chat_completion_ollama(
         messages,
         stream: Some(false),
         options: opts.ollama_options(),
+        tools: opts.tools.clone(),
     };
 
     let response = client
@@ -588,6 +631,8 @@ async fn chat_completion_openai(
         stream: Some(false),
         temperature: opts.temperature,
         max_tokens: opts.max_tokens,
+        tools: opts.tools,
+        tool_choice: opts.tool_choice,
     };
 
     let response = client
@@ -646,6 +691,42 @@ async fn chat_completion_stream(
     }
 }
 
+/// Fold one delta's tool-call fragments into the accumulator.
+///
+/// The OpenAI streaming contract: fragments carry an `index`; the first
+/// fragment for an index establishes `id`, `type` and `function.name`; every
+/// fragment's `function.arguments` is a string SHARD to append. Concatenation
+/// is the whole algorithm — parsing shards individually would fail on every
+/// boundary that splits a JSON token.
+fn merge_tool_call_fragments(
+    parts: &mut std::collections::BTreeMap<u64, serde_json::Value>,
+    fragments: Vec<serde_json::Value>,
+) {
+    for fragment in fragments {
+        let index = fragment.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+        let entry = parts.entry(index).or_insert_with(|| serde_json::json!({
+            "type": "function",
+            "function": { "name": "", "arguments": "" },
+        }));
+
+        if let Some(id) = fragment.get("id").and_then(|v| v.as_str()) {
+            entry["id"] = serde_json::json!(id);
+        }
+        if let Some(function) = fragment.get("function") {
+            if let Some(name) = function.get("name").and_then(|v| v.as_str()) {
+                if !name.is_empty() {
+                    entry["function"]["name"] = serde_json::json!(name);
+                }
+            }
+            if let Some(shard) = function.get("arguments").and_then(|v| v.as_str()) {
+                let held = entry["function"]["arguments"].as_str().unwrap_or("");
+                entry["function"]["arguments"] =
+                    serde_json::json!(format!("{held}{shard}"));
+            }
+        }
+    }
+}
+
 fn send_chunk(
     tx: &mpsc::UnboundedSender<String>,
     msg: ChunkMessage,
@@ -672,6 +753,7 @@ async fn chat_completion_stream_ollama(
         messages,
         stream: Some(true),
         options: opts.ollama_options(),
+        tools: opts.tools.clone(),
     };
 
     // Tracing between "Starting inference" and silence. Production showed
@@ -703,6 +785,9 @@ async fn chat_completion_stream_ollama(
     let mut buf = String::new();
     let mut content = String::new();
     let mut thinking = String::new();
+    // Ollama sends tool calls whole, on the message that carries them. Last
+    // one wins, which for a single-turn completion is the only one.
+    let mut tool_calls: Option<serde_json::Value> = None;
     let mut resolved_model = model.to_string();
     let mut prompt_tokens = 0u32;
     let mut completion_tokens = 0u32;
@@ -735,6 +820,9 @@ async fn chat_completion_stream_ollama(
                 resolved_model = m;
             }
             if let Some(msg) = chunk.message {
+                if msg.tool_calls.is_some() {
+                    tool_calls = msg.tool_calls;
+                }
                 // Thinking FIRST: a reasoning model emits only `thinking` for
                 // the whole reasoning phase, with content empty. Skipping
                 // these is what made a working model look like a hung request.
@@ -790,6 +878,7 @@ async fn chat_completion_stream_ollama(
                 role: "assistant".to_string(),
                 content,
                 thinking: if thinking.is_empty() { None } else { Some(thinking) },
+                tool_calls,
             },
             finish_reason: Some("stop".to_string()),
         }],
@@ -829,6 +918,14 @@ async fn chat_completion_stream_openai(
     if let Some(n) = opts.max_tokens {
         request["max_tokens"] = serde_json::json!(n);
     }
+    // Inserted only when present — a request without tools must stay
+    // byte-identical to what this daemon sent before tools existed.
+    if let Some(tools) = opts.tools {
+        request["tools"] = tools;
+        if let Some(choice) = opts.tool_choice {
+            request["tool_choice"] = choice;
+        }
+    }
 
     let response = client
         .post(&url)
@@ -848,6 +945,12 @@ async fn chat_completion_stream_openai(
     let mut buf = String::new();
     let mut content = String::new();
     let mut thinking = String::new();
+    // Tool-call fragments, keyed by the stream's own `index`, assembled into
+    // whole calls at the end. Arguments arrive as string SHARDS across many
+    // deltas — "{\"ro", "le\": \"hiri", "ng\"}" — so nothing here parses them;
+    // assembly concatenates and the caller judges the JSON whole.
+    let mut tool_call_parts: std::collections::BTreeMap<u64, serde_json::Value> =
+        std::collections::BTreeMap::new();
     let mut resolved_model = model.to_string();
     let mut usage: Option<OpenAIUsage> = None;
     let mut finish_reason: Option<String> = None;
@@ -895,6 +998,10 @@ async fn chat_completion_stream_openai(
                         index += 1;
                     }
                 }
+                if let Some(fragments) = choice.delta.tool_calls {
+                    merge_tool_call_fragments(&mut tool_call_parts, fragments);
+                }
+
                 if let Some(delta) = choice.delta.content {
                     if !delta.is_empty() {
                         content.push_str(&delta);
@@ -914,6 +1021,12 @@ async fn chat_completion_stream_openai(
                 role: "assistant".to_string(),
                 content,
                 thinking: if thinking.is_empty() { None } else { Some(thinking) },
+                tool_calls: if tool_call_parts.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Array(
+                        tool_call_parts.into_values().collect()))
+                },
             },
             finish_reason: finish_reason.or_else(|| Some("stop".to_string())),
         }],
@@ -995,6 +1108,7 @@ async fn run_interview_prompt(
         role: "user".to_string(),
         content: prompt.prompt.clone(),
         thinking: None,
+        tool_calls: None,
     }];
     
     // NO token cap here, deliberately.
@@ -1235,6 +1349,8 @@ async fn handle_sse_event(
             let opts = GenOpts {
                 temperature: payload.temperature,
                 max_tokens: payload.max_tokens,
+                tools: payload.tools,
+                tool_choice: payload.tool_choice,
             };
             info!("[#{}] Inference request: {} ({}) via {}{} [queued]",
                 count, request_id, model, mode,
@@ -1811,6 +1927,8 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                         let opts = GenOpts {
                                             temperature: payload.temperature,
                                             max_tokens: payload.max_tokens,
+                                            tools: payload.tools,
+                                            tool_choice: payload.tool_choice,
                                         };
 
                                         info!("[#{}] Inference request: {} ({}) via {}{} [queued]",
@@ -2104,7 +2222,7 @@ mod stream_tests {
         let resp = chat_completion_stream_ollama(
             &base,
             "muse-local:latest",
-            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None, tool_calls: None }],
             GenOpts::default(),
             "pin_req_test",
             &tx,
@@ -2149,7 +2267,7 @@ mod stream_tests {
         let resp = chat_completion_stream_openai(
             &base,
             "m",
-            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None, tool_calls: None }],
             GenOpts::default(),
             "pin_req_sse",
             &tx,
@@ -2163,6 +2281,70 @@ mod stream_tests {
         assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
         let usage = resp.usage.expect("usage frame");
         assert_eq!(usage.total_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn tool_call_shards_assemble_into_whole_calls() {
+        // The OpenAI streaming contract splits ONE tool call across many
+        // deltas: the first fragment carries id and function.name, and every
+        // fragment appends a string SHARD to function.arguments — shards that
+        // split JSON mid-token ("{\"ro" / "le\": \"hiri" / "ng\"}"). Parsing
+        // shards individually fails on every boundary; the only correct
+        // algorithm is concatenation, judged whole at the end.
+        //
+        // Undeclared, serde would drop the fragments and a perfect structured
+        // answer would arrive as an EMPTY message — the exact silence that ate
+        // temperature, max_tokens, thinking, and reasoning_content before it.
+        let base = serve_once(vec![
+            "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"declare_role\",\"arguments\":\"\"}}]}}]}\n\n".to_string(),
+            "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"ro\"}}]}}]}\n\n".to_string(),
+            "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"le\\\": \\\"hiri\"}}]}}]}\n\n".to_string(),
+            "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"ng\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ]);
+
+        let (tx, mut _rx) = mpsc::unbounded_channel::<String>();
+        let resp = chat_completion_stream_openai(
+            &base,
+            "m",
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None, tool_calls: None }],
+            GenOpts::default(),
+            "pin_req_tools",
+            &tx,
+        )
+        .await
+        .expect("stream should succeed");
+
+        let calls = resp.choices[0].message.tool_calls.as_ref()
+            .expect("the assembled response must carry the tool calls");
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[0]["function"]["name"], "declare_role");
+        // The shards, concatenated, are valid JSON naming a role from the
+        // closed set — which is the whole point of tools over prose.
+        let arguments: serde_json::Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap())
+                .expect("concatenated shards must parse as one JSON object");
+        assert_eq!(arguments["role"], "hiring");
+        assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[tokio::test]
+    async fn a_request_without_tools_serializes_without_a_tools_key() {
+        // llama.cpp applies its chat template differently for a present-but-
+        // null `tools`; a request that doesn't use tools must stay
+        // byte-identical to what this daemon sent before tools existed.
+        let request = OpenAIChatRequest {
+            model: "m".into(),
+            messages: vec![],
+            stream: Some(false),
+            temperature: None,
+            max_tokens: None,
+            tools: None,
+            tool_choice: None,
+        };
+        let wire = serde_json::to_value(&request).unwrap();
+        assert!(wire.get("tools").is_none(), "absent, not null: {}", wire);
+        assert!(wire.get("tool_choice").is_none());
     }
 
     #[tokio::test]
@@ -2187,7 +2369,7 @@ mod stream_tests {
         let resp = chat_completion_stream_openai(
             &base,
             "m",
-            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None, tool_calls: None }],
             GenOpts::default(),
             "pin_req_reason",
             &tx,
@@ -2223,7 +2405,7 @@ mod stream_tests {
         let err = chat_completion_stream_ollama(
             &base,
             "m",
-            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None, tool_calls: None }],
             GenOpts::default(),
             "pin_req_dead",
             &tx,
@@ -2255,7 +2437,7 @@ mod stream_tests {
         let err = chat_completion_stream_ollama(
             &format!("http://{}", addr),
             "nope",
-            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None, tool_calls: None }],
             GenOpts::default(),
             "pin_req_404",
             &tx,
@@ -2277,8 +2459,8 @@ mod stream_tests {
         chat_completion_stream_ollama(
             &base,
             "m",
-            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
-            GenOpts { temperature: Some(0.15), max_tokens: Some(64) },
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None, tool_calls: None }],
+            GenOpts { temperature: Some(0.15), max_tokens: Some(64), ..Default::default() },
             "pin_req_opts",
             &tx,
         )
@@ -2295,7 +2477,7 @@ mod stream_tests {
     #[test]
     fn empty_options_are_omitted_so_model_defaults_apply() {
         assert!(GenOpts::default().ollama_options().is_none());
-        let o = GenOpts { temperature: None, max_tokens: Some(8) };
+        let o = GenOpts { temperature: None, max_tokens: Some(8), ..Default::default() };
         let v = o.ollama_options().unwrap();
         assert_eq!(v["num_predict"], 8);
         assert!(v.get("temperature").is_none());
@@ -2362,7 +2544,7 @@ mod stream_tests {
         let resp = chat_completion_stream_ollama(
             &base,
             "muse-local:latest",
-            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None, tool_calls: None }],
             GenOpts::default(),
             "pin_req_thinking",
             &tx,
@@ -2406,7 +2588,7 @@ mod stream_tests {
         let (tx, mut rx) = mpsc::unbounded_channel::<String>();
         let resp = chat_completion_stream_ollama(
             &base, "m",
-            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None, tool_calls: None }],
             GenOpts::default(), "pin_req_nothought", &tx,
         )
         .await
@@ -2627,7 +2809,7 @@ mod stream_tests {
 
         // Requests we send to ollama must not grow a `thinking` key.
         let m = serde_json::to_value(ChatMessage {
-            role: "user".into(), content: "hi".into(), thinking: None,
+            role: "user".into(), content: "hi".into(), thinking: None, tool_calls: None,
         }).unwrap();
         assert!(m.get("thinking").is_none(), "must be skipped when None: {}", m);
     }
