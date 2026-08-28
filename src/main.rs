@@ -358,6 +358,16 @@ struct OpenAIStreamChoice {
 struct OpenAIStreamDelta {
     #[serde(default)]
     content: Option<String>,
+    /// A reasoning model's thinking channel, as OpenAI-compatible servers
+    /// stream it. llama.cpp's llama-server spells it `reasoning_content`;
+    /// some gateways shorten it to `reasoning`. Same bug class as the
+    /// documented ollama `thinking` drop above: undeclared, serde discarded
+    /// it, and every reasoning delta silently vanished between the backend
+    /// and the operator watching the stream — found 2026-08-28 when the
+    /// thinking trace disappeared the day the backend swapped from ollama
+    /// (which spells it `message.thinking`) to llama-server.
+    #[serde(default, alias = "reasoning")]
+    reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -837,6 +847,7 @@ async fn chat_completion_stream_openai(
     let mut stream = response.bytes_stream();
     let mut buf = String::new();
     let mut content = String::new();
+    let mut thinking = String::new();
     let mut resolved_model = model.to_string();
     let mut usage: Option<OpenAIUsage> = None;
     let mut finish_reason: Option<String> = None;
@@ -873,6 +884,17 @@ async fn chat_completion_stream_openai(
                 if choice.finish_reason.is_some() {
                     finish_reason = choice.finish_reason;
                 }
+                // Thinking FIRST, mirroring the ollama path above: a
+                // reasoning model emits only its thinking channel for the
+                // whole reasoning phase, with content empty. These deltas
+                // are what proves a silent model is working, not hung.
+                if let Some(think) = choice.delta.reasoning_content {
+                    if !think.is_empty() {
+                        thinking.push_str(&think);
+                        send_chunk(tx, ChunkMessage::thinking(request_id, index, think))?;
+                        index += 1;
+                    }
+                }
                 if let Some(delta) = choice.delta.content {
                     if !delta.is_empty() {
                         content.push_str(&delta);
@@ -891,7 +913,7 @@ async fn chat_completion_stream_openai(
             message: ChatMessage {
                 role: "assistant".to_string(),
                 content,
-                thinking: None,
+                thinking: if thinking.is_empty() { None } else { Some(thinking) },
             },
             finish_reason: finish_reason.or_else(|| Some("stop".to_string())),
         }],
@@ -2141,6 +2163,51 @@ mod stream_tests {
         assert_eq!(resp.choices[0].finish_reason.as_deref(), Some("stop"));
         let usage = resp.usage.expect("usage frame");
         assert_eq!(usage.total_tokens, 7);
+    }
+
+    #[tokio::test]
+    async fn openai_sse_reasoning_content_is_forwarded_not_serde_dropped() {
+        // Regression, found 2026-08-28: the day the backend swapped from
+        // ollama to llama-server, every thinking trace vanished from the
+        // operator's stream. Ollama spells the reasoning channel
+        // `message.thinking` (declared); llama-server spells it
+        // `delta.reasoning_content` (undeclared, serde dropped it). Same bug
+        // class as the documented `thinking` drop — a working reasoning model
+        // looked like one that never thought at all.
+        let base = serve_once(vec![
+            // The whole reasoning phase arrives with content ABSENT.
+            "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"reasoning_content\":\"weighing \"}}]}\n\n".to_string(),
+            // Some gateways shorten the key; the alias must catch it too.
+            "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"reasoning\":\"the evidence\"}}]}\n\n".to_string(),
+            "data: {\"model\":\"m\",\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n".to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ]);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+        let resp = chat_completion_stream_openai(
+            &base,
+            "m",
+            vec![ChatMessage { role: "user".into(), content: "hi".into(), thinking: None }],
+            GenOpts::default(),
+            "pin_req_reason",
+            &tx,
+        )
+        .await
+        .expect("stream should succeed");
+
+        let chunks = drain(&mut rx);
+        assert_eq!(chunks.len(), 3, "two thinking deltas and one content delta");
+        assert_eq!(chunks[0]["kind"], "thinking",
+            "the reasoning phase must reach the operator as thinking chunks");
+        assert_eq!(chunks[1]["kind"], "thinking");
+        assert_eq!(chunks[1]["delta"], "the evidence",
+            "the short-key `reasoning` alias must be forwarded too");
+        assert_eq!(chunks[2]["kind"], "content");
+
+        assert_eq!(resp.choices[0].message.content, "answer",
+            "reasoning must never leak into content");
+        assert_eq!(resp.choices[0].message.thinking.as_deref(), Some("weighing the evidence"),
+            "the assembled response carries the full thinking trace, like the ollama path");
     }
 
     #[tokio::test]
