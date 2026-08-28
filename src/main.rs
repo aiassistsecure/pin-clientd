@@ -142,6 +142,17 @@ enum ServerMessage {
         #[serde(default)]
         required_models: Option<Vec<String>>,
     },
+    /// ANYTHING THE SERVER ADDS NEXT.
+    ///
+    /// `RESULT_ACK` was additive and harmless, and it still produced an error
+    /// per completed job because an unknown tag was a parse FAILURE rather
+    /// than a message this build does not handle yet. The two sides of this
+    /// protocol ship independently; the server will add another event, and an
+    /// operator should not have to upgrade to stop the noise.
+    ///
+    /// Adding the one variant fixed the one symptom. This fixes the class.
+    #[serde(other)]
+    Unrecognized,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1057,6 +1068,46 @@ async fn execute_interview(
 
 /// Dispatch one SSE event through the same handlers the WebSocket path uses.
 /// Returns Err only when the connection itself must die.
+/// What one node can serve RIGHT NOW: whatever the backend lists, plus any
+/// configured TTS models tagged `tts:`.
+///
+/// Returns EMPTY on a failed poll, and callers must treat empty as "could not
+/// ask" rather than "serves nothing" — advertising an empty set retracts a
+/// working node. Shared by the connect-time registration and the periodic
+/// re-discovery so the two cannot drift apart.
+async fn discover_node_models(node_config: &NodeConfig) -> Vec<String> {
+    let mut models = match get_models(&node_config.inference_uri, &node_config.api_mode).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("Model discovery failed for {} ({}): {}",
+                  node_config.alias, node_config.api_mode, e);
+            return Vec::new();
+        }
+    };
+    if node_config.tts_uri.is_some() {
+        for m in node_config.tts_models.clone().unwrap_or_default() {
+            let tagged = format!("tts:{}", m);
+            if !models.contains(&tagged) {
+                models.push(tagged);
+            }
+        }
+    }
+    models
+}
+
+/// The union across every configured node, in declaration order, deduplicated.
+async fn discover_models(config: &Config) -> Vec<String> {
+    let mut all: Vec<String> = Vec::new();
+    for node_config in &config.nodes {
+        for m in discover_node_models(node_config).await {
+            if !all.contains(&m) {
+                all.push(m);
+            }
+        }
+    }
+    all
+}
+
 async fn handle_sse_event(
     config: &Config,
     event: sse::SseEvent,
@@ -1089,6 +1140,9 @@ async fn handle_sse_event(
         | ServerMessage::MODEL_LIST_ACK
         | ServerMessage::PING
         | ServerMessage::RESULT_ACK { .. } => {}
+        ServerMessage::Unrecognized => {
+            debug!("Ignoring an event this build has no handler for");
+        }
         ServerMessage::UPDATE_WALLET_ACK { success, message } => {
             if success { info!("[WALLET] {}", message); } else { warn!("[WALLET] Failed: {}", message); }
         }
@@ -1310,10 +1364,26 @@ async fn run_sse_connection(config: &Config, max_threads: usize) -> Result<(), B
             }
         }
         if models.is_empty() {
-            warn!("No models found for node {} - check endpoint {}", node_config.alias, node_config.inference_uri);
-        } else {
-            info!("Node {} has {} models: {:?}", node_config.alias, models.len(), models);
+            // AN EMPTY LIST IS NOT AN ADVERTISEMENT, IT IS A RETRACTION.
+            //
+            // `get_models` returning Err falls through to `vec![]`, and that
+            // empty vec was REGISTERED -- telling the network this node serves
+            // nothing. On 2026-08-28 an unrelated response-shape change made
+            // one poll fail, and the node's advertisement was blanked by its
+            // own daemon. Nothing restored it, because registration only ran
+            // at startup.
+            //
+            // "I could not ask" and "the answer is none" are different facts.
+            // Skip, and let the re-discovery tick below pick the node up when
+            // the endpoint answers again -- leaving whatever the network
+            // already knows in place, which beats erasing it.
+            warn!("No models found for node {} - check endpoint {}. \
+                   Skipping registration rather than advertising an empty set; \
+                   will retry on the next discovery tick.",
+                  node_config.alias, node_config.inference_uri);
+            continue;
         }
+        info!("Node {} has {} models: {:?}", node_config.alias, models.len(), models);
         for model in &models {
             if !advertised_models.contains(model) {
                 advertised_models.push(model.clone());
@@ -1408,10 +1478,50 @@ async fn run_sse_connection(config: &Config, max_threads: usize) -> Result<(), B
                     break;
                 }
                 heartbeat_ticks += 1;
-                if heartbeat_ticks.is_multiple_of(4) && !advertised_models.is_empty() {
-                    if let Err(e) = session.heartbeat(Some(advertised_models.as_slice())).await {
-                        warn!("SSE model rebroadcast failed: {}", e);
-                        break;
+                if heartbeat_ticks.is_multiple_of(4) {
+                    // RE-DISCOVER, DO NOT JUST REPEAT.
+                    //
+                    // The advertised set was computed once, at connect, so a
+                    // model that becomes servable later is invisible to the
+                    // network until the operator restarts the daemon. That is
+                    // exactly what happened when deepseek-r1:32b became
+                    // resident on a running box and every request for it was
+                    // answered "No operators available for model".
+                    //
+                    // The model set is a property of the backend right now,
+                    // not a fact captured at startup, so it is re-read on the
+                    // tick that was already re-asserting it.
+                    let fresh = discover_models(config).await;
+                    if !fresh.is_empty() && fresh != advertised_models {
+                        let added: Vec<&String> =
+                            fresh.iter().filter(|m| !advertised_models.contains(m)).collect();
+                        let gone: Vec<&String> =
+                            advertised_models.iter().filter(|m| !fresh.contains(m)).collect();
+                        info!("Model set changed (+{:?} -{:?}) — re-registering", added, gone);
+                        advertised_models = fresh;
+                        for node_config in &config.nodes {
+                            let per_node = discover_node_models(node_config).await;
+                            if per_node.is_empty() {
+                                continue;   // never retract on a failed poll
+                            }
+                            if let Err(e) = session.register_node(
+                                &node_config.alias,
+                                &per_node,
+                                node_config.capacity,
+                                &node_config.region,
+                                node_config.price_per_thousand_tokens,
+                                node_config.interview_model.as_deref(),
+                                &node_config.api_mode,
+                            ).await {
+                                warn!("Re-register of {} failed: {}", node_config.alias, e);
+                            }
+                        }
+                    }
+                    if !advertised_models.is_empty() {
+                        if let Err(e) = session.heartbeat(Some(advertised_models.as_slice())).await {
+                            warn!("SSE model rebroadcast failed: {}", e);
+                            break;
+                        }
                     }
                 }
             }
@@ -1623,6 +1733,9 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                     ServerMessage::HEARTBEAT_ACK
                                     | ServerMessage::MODEL_LIST_ACK
                                     | ServerMessage::RESULT_ACK { .. } => {}
+        ServerMessage::Unrecognized => {
+            debug!("Ignoring an event this build has no handler for");
+        }
                                     ServerMessage::UPDATE_WALLET_ACK { success, message } => {
                                         if success {
                                             info!("[WALLET] {}", message);
@@ -2608,5 +2721,33 @@ mod stream_tests {
         assert_eq!(ev.payload(), r#"{"type":"PING"}"#);
         let keep = sse::SseEvent { event_type: String::new(), data: String::new() };
         assert_eq!(keep.payload(), "");
+    }
+
+    #[test]
+    fn an_event_this_build_has_never_heard_of_is_ignored_not_fatal() {
+        // The general form of the RESULT_ACK bug. Adding the one variant
+        // fixed the one symptom; the class is "server and daemon ship
+        // independently", so the NEXT additive event must not error per job
+        // on a daemon nobody has rebuilt yet.
+        let raw = r#"{"type": "SOMETHING_SHIPPED_NEXT_QUARTER", "whatever": 1}"#;
+        assert!(matches!(
+            serde_json::from_str::<ServerMessage>(raw).expect("must parse"),
+            ServerMessage::Unrecognized
+        ));
+    }
+
+    #[test]
+    fn the_catch_all_does_not_swallow_events_that_have_handlers() {
+        // An INFERENCE_REQUEST quietly absorbed by the wildcard is a node that
+        // looks online and answers nothing -- worse than the noise it fixes.
+        for raw in [
+            r#"{"type": "HEARTBEAT_ACK"}"#,
+            r#"{"type": "RESULT_ACK", "request_id": "pin_req_x"}"#,
+        ] {
+            assert!(!matches!(
+                serde_json::from_str::<ServerMessage>(raw).expect("must parse"),
+                ServerMessage::Unrecognized
+            ), "known event misrouted to the catch-all: {raw}");
+        }
     }
 }
