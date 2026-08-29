@@ -111,6 +111,36 @@ fn next_reconnect_delay(configured: u64) -> u64 {
     configured.max(requested)
 }
 
+/// Every generation currently running, by request_id, abortable.
+///
+/// Aborting the task drops the reqwest stream to the local backend, and
+/// ollama/llama.cpp cancel generation when their client disconnects — so one
+/// abort here frees the GPU, not just this process. Entries remove
+/// themselves when a task finishes normally, so a cancel for a request that
+/// already completed is a no-op, which is the common race and not an error.
+static RUNNING_REQUESTS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn track_generation(request_id: &str, handle: tokio::task::AbortHandle) {
+    RUNNING_REQUESTS.lock().unwrap().insert(request_id.to_string(), handle);
+}
+
+fn finish_generation(request_id: &str) {
+    RUNNING_REQUESTS.lock().unwrap().remove(request_id);
+}
+
+/// Abort a running generation. Returns whether anything was running.
+fn cancel_generation(request_id: &str) -> bool {
+    match RUNNING_REQUESTS.lock().unwrap().remove(request_id) {
+        Some(handle) => {
+            handle.abort();
+            true
+        }
+        None => false,
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[allow(non_camel_case_types, clippy::upper_case_acronyms)]
@@ -131,6 +161,14 @@ enum ServerMessage {
     REGISTER_NODE_ACK { node_id: String, alias: String, models: Vec<String>, created: bool, message: String },
     UPDATE_WALLET_ACK { success: bool, message: String },
     INFERENCE_REQUEST { request_id: String, payload: InferencePayload },
+    /// The gateway says NOBODY IS WAITING for this request anymore — the
+    /// caller aborted mid-stream, or its wait timed out. Abort the running
+    /// generation instead of finishing it in the dark: the observed failure
+    /// was a caller retrying a looping resume read while this daemon kept
+    /// generating every aborted attempt to the last token, until the queue
+    /// drowned with the model perfectly healthy. Additive: a gateway that
+    /// never sends it changes nothing.
+    CANCEL_REQUEST { request_id: String },
     /// Text-to-speech. Purely ADDITIVE, same family as INFERENCE_REQUEST: a
     /// server that never sends it changes nothing, and a daemon without a
     /// ttsUri answers with TTS_ERROR instead of hanging the request.
@@ -1368,7 +1406,8 @@ async fn handle_sse_event(
                 if stream { " streaming" } else { "" });
             let sem = semaphore.clone();
             let tx = tx.clone();
-            tokio::spawn(async move {
+            let rid = request_id.clone();
+            let task = tokio::spawn(async move {
                 let _permit = sem.acquire().await.expect("semaphore closed");
                 info!("[#{}] Starting inference for {}", count, request_id);
                 let result = if stream {
@@ -1376,6 +1415,7 @@ async fn handle_sse_event(
                 } else {
                     chat_completion(&uri, &model, messages, &mode, opts).await
                 };
+                finish_generation(&request_id);
                 let response = match result {
                     Ok(openai_resp) => {
                         let usage = openai_resp.usage.as_ref();
@@ -1406,6 +1446,14 @@ async fn handle_sse_event(
                     info!("[#{}] Response queued for send", count);
                 }
             });
+            track_generation(&rid, task.abort_handle());
+        }
+        ServerMessage::CANCEL_REQUEST { request_id } => {
+            if cancel_generation(&request_id) {
+                info!("[CANCEL] Aborted running generation {} — nobody was waiting", request_id);
+            } else {
+                debug!("[CANCEL] {} not running (already finished) — the common race, not an error", request_id);
+            }
         }
     }
     Ok(())
@@ -1949,9 +1997,11 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                         
                                         let sem = semaphore.clone();
                                         let tx = tx.clone();
-                                        
-                                        tokio::spawn(async move {
+                                        let rid = request_id.clone();
+
+                                        let task = tokio::spawn(async move {
                                             let _permit = sem.acquire().await.expect("semaphore closed");
+                                            let request_id_done = request_id.clone();
                                             
                                             info!("[#{}] Starting inference for {}", count, request_id);
                                             let result = if stream {
@@ -1992,11 +2042,20 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                                 }
                                             };
 
+                                            finish_generation(&request_id_done);
                                             if let Ok(json) = serde_json::to_string(&response) {
                                                 let _ = tx.send(json);
                                                 info!("[#{}] Response queued for send", count);
                                             }
                                         });
+                                        track_generation(&rid, task.abort_handle());
+                                    }
+                                    ServerMessage::CANCEL_REQUEST { request_id } => {
+                                        if cancel_generation(&request_id) {
+                                            info!("[CANCEL] Aborted running generation {} — nobody was waiting", request_id);
+                                        } else {
+                                            debug!("[CANCEL] {} not running (already finished)", request_id);
+                                        }
                                     }
                                 }
                             }
@@ -2629,6 +2688,46 @@ mod stream_tests {
         let enc = base64_encode(&all);
         assert_eq!(enc.len(), 344);
         assert!(enc.ends_with("=="), "256 % 3 == 1 -> two pad chars");
+    }
+
+    #[test]
+    fn cancel_request_parses_and_unknown_ids_cancel_nothing() {
+        // The frame the gateway sends when nobody is waiting anymore. A daemon
+        // that cannot parse it would WARN and ignore — which is the pre-cancel
+        // behavior, so even the failure mode is additive.
+        let raw = r#"{"type":"CANCEL_REQUEST","request_id":"pin_req_zombie"}"#;
+        match serde_json::from_str::<ServerMessage>(raw).expect("must parse") {
+            ServerMessage::CANCEL_REQUEST { request_id } => {
+                assert_eq!(request_id, "pin_req_zombie");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        // A cancel for a request that already finished is the COMMON RACE,
+        // not an error: the registry answers false and nothing explodes.
+        assert!(!cancel_generation("pin_req_never_existed"));
+    }
+
+    #[tokio::test]
+    async fn a_tracked_generation_dies_when_cancelled_and_cleans_up_when_not() {
+        // Cancelled: the task is aborted mid-"generation" and never completes.
+        let endless = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+        });
+        track_generation("req_cancel_me", endless.abort_handle());
+        assert!(cancel_generation("req_cancel_me"),
+            "a running generation is found and aborted");
+        let joined = endless.await;
+        assert!(joined.unwrap_err().is_cancelled(),
+            "abort reaches the task — the reqwest stream drops, the backend stops");
+
+        // Finished normally: the entry removes itself, so a late cancel is a
+        // no-op instead of aborting a slot some future request might reuse.
+        let quick = tokio::spawn(async { finish_generation("req_done"); });
+        track_generation("req_done", quick.abort_handle());
+        quick.await.unwrap();
+        assert!(!cancel_generation("req_done"),
+            "a completed generation left nothing behind to cancel");
     }
 
     #[test]
