@@ -57,6 +57,17 @@ struct NodeConfig {
     tts_models: Option<Vec<String>>,
 }
 
+/// The interview model this node should advertise: the operator's explicit
+/// choice when config sets one, otherwise the first model the node actually
+/// serves. The config key is an OVERRIDE, not a requirement — fleets change
+/// all the time, and a node must never need a config edit (or a first-party
+/// name hardcoded server-side) just to stay interviewable.
+fn effective_interview_model(configured: Option<&str>, models: &[String]) -> Option<String> {
+    configured
+        .map(str::to_string)
+        .or_else(|| models.first().cloned())
+}
+
 fn default_price() -> f64 {
     0.001
 }
@@ -1463,7 +1474,7 @@ async fn run_sse_connection(config: &Config, max_threads: usize) -> Result<(), B
             node_config.capacity,
             &node_config.region,
             node_config.price_per_thousand_tokens,
-            node_config.interview_model.as_deref(),
+            effective_interview_model(node_config.interview_model.as_deref(), &models).as_deref(),
             &node_config.api_mode,
         ).await {
             error!("Failed to register node {} over SSE: {}", node_config.alias, e);
@@ -1715,7 +1726,8 @@ async fn run_connection(config: &Config, max_threads: usize) -> Result<(), Box<d
                                                 capacity: node_config.capacity,
                                                 region: node_config.region.clone(),
                                                 price_per_thousand_tokens: node_config.price_per_thousand_tokens,
-                                                interview_model: node_config.interview_model.clone(),
+                                                interview_model: effective_interview_model(
+                                                    node_config.interview_model.as_deref(), &models),
                                             };
                                             
                                             if control_tx.send(Message::Text(serde_json::to_string(&register_msg)?)).is_err() {
@@ -2783,6 +2795,29 @@ mod stream_tests {
         };
         run_connection(&config, 1).await.unwrap();
         server.await.unwrap();
+    }
+
+    #[test]
+    fn interview_model_defaults_to_the_first_served_model() {
+        // Fleets change all the time. An unset interviewModel must follow the
+        // fleet instead of requiring a config edit — and an explicit config
+        // value must still win.
+        let served = vec!["muse-local:latest".to_string(), "gpt-oss:20b".to_string()];
+        assert_eq!(
+            effective_interview_model(None, &served).as_deref(),
+            Some("muse-local:latest"),
+            "unset config follows the fleet",
+        );
+        assert_eq!(
+            effective_interview_model(Some("gpt-oss:20b"), &served).as_deref(),
+            Some("gpt-oss:20b"),
+            "an explicit config choice is an override and always wins",
+        );
+        assert_eq!(
+            effective_interview_model(None, &[]),
+            None,
+            "no models is still honestly no interview model",
+        );
     }
 
     #[test]
